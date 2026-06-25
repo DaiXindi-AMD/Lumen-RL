@@ -70,7 +70,17 @@ class RLTrainer:
         self._tokenizer: Any = None
         self._dataset: Any = None
         self._atom_engine: Any = None
-        self._use_atom: bool = config.policy.generation_backend.lower() == "atom"
+        self._gen_backend: str = config.policy.generation_backend.lower()
+        self._use_vllm: bool = self._gen_backend == "vllm"
+        _vcfg = config.policy.generation.vllm_cfg
+        # Keep one vLLM resident per GPU and update weights in place (no rebuild).
+        self._vllm_persistent: bool = self._use_vllm and bool(getattr(_vcfg, "persistent", True))
+        # Each rank generates its own shard of the batch on its local GPU.
+        self._vllm_dp: bool = self._use_vllm and bool(getattr(_vcfg, "data_parallel_rollout", True))
+        # ``_use_atom`` is kept as the "external colocated inference engine" flag
+        # (offload optimizer during rollout, sleep engine during training,
+        # safetensors weight sync). Both ATOM and vanilla vLLM use this path.
+        self._use_atom: bool = self._gen_backend in ("atom", "vllm")
         # Ray controller orchestration path is opt-in via config/env/ray address.
         self._use_ray_controller: bool = (
             bool(getattr(config.controller.ray, "enabled", False))
@@ -88,6 +98,9 @@ class RLTrainer:
         self._prev_step_profile: bool = False
         self._curr_step_profile: bool = False
         self._val_dataset: Any = None
+        # Running prompt cursor for DAPO dynamic sampling (advances across
+        # generation rounds, not just steps).
+        self._prompt_cursor: int = 0
         self._is_distributed: bool = torch.distributed.is_initialized()
         self._rank: int = torch.distributed.get_rank() if self._is_distributed else 0
         self._world_size: int = torch.distributed.get_world_size() if self._is_distributed else 1
@@ -140,12 +153,24 @@ class RLTrainer:
         logger.info("[rank %d] Building actor model via Engine layer: %s (backend=%s, optimizer_dtype=%s)",
                     self._rank, model_name, backend_key, optimizer_dtype_str)
 
+        # Mixed-precision training (verl-aligned): the optimizer keeps FP32
+        # master weights so that small Adam updates (lr ~1e-6) accumulate
+        # correctly, while forward/backward compute uses ``optimizer_dtype``
+        # (typically bf16) via FSDP2 MixedPrecisionPolicy. Storing the master
+        # in bf16 silently drops ~1e-6 updates to rounding (bf16 eps ~8e-3),
+        # which stalls learning entirely. Reduce dtype stays FP32.
+        compute_dtype_str = optimizer_dtype_str
+        master_dtype_str = "fp32"
         engine_config = {
             "param_offload": fsdp_cfg_dict.get("param_offload", False),
             "optimizer_offload": fsdp_cfg_dict.get("optimizer_offload", False),
             "grad_offload": fsdp_cfg_dict.get("grad_offload", False),
             "reshard_after_forward": fsdp_cfg_dict.get("reshard_after_forward", True),
-            "model_dtype": optimizer_dtype_str,
+            "model_dtype": master_dtype_str,
+            "mixed_precision": {
+                "param_dtype": compute_dtype_str,
+                "reduce_dtype": "fp32",
+            },
             "seed": getattr(self.config, "seed", 42),
         }
         optimizer_config = {
@@ -211,7 +236,15 @@ class RLTrainer:
             self._ref_on_cpu = True
             logger.info("[rank %d] Skipping reference model (kl_coeff=0).", self._rank)
 
-        if self._use_atom:
+        if self._use_vllm:
+            from lumenrl.engine.inference.vllm_engine import VLLMEngine
+            vllm_cfg = self.config.policy.generation.vllm_cfg
+            self._atom_engine = VLLMEngine(config=vllm_cfg, model_name=model_name)
+            logger.info(
+                "[rank %d] vLLM engine configured (lazy init on first rollout, "
+                "calculate_log_probs=%s).", self._rank, vllm_cfg.calculate_log_probs,
+            )
+        elif self._use_atom:
             from lumenrl.engine.inference.atom_engine import AtomEngine
             atom_cfg = self.config.policy.generation.atom_cfg
             self._atom_engine = AtomEngine(config=atom_cfg, model_name=model_name)
@@ -566,63 +599,78 @@ class RLTrainer:
 
     def _get_batch_prompts(self, step: int) -> tuple[list[str], list[str]]:
         """Get a batch of (prompts, ground_truths) for the current step."""
-        import json as _json
-
         g = _algo_num_generations(self.config)
         num_prompts = max(1, self.config.policy.train_global_batch_size // g)
+        start = step * num_prompts
+        return self._get_prompts_range(start, num_prompts)
+
+    def _get_prompts_range(self, start: int, count: int) -> tuple[list[str], list[str]]:
+        """Get ``count`` (prompt, ground_truth) pairs starting at global index ``start``.
+
+        Wraps around the dataset. Used by both the fixed-batch path and the DAPO
+        dynamic-sampling regeneration loop (which advances a running cursor).
+        """
+        import json as _json
 
         if self._dataset is None:
-            prompts = [f"What is {i + step * num_prompts} + {i + step * num_prompts + 1}?"
-                       for i in range(num_prompts)]
-            gts = [str(2 * (i + step * num_prompts) + 1) for i in range(num_prompts)]
+            prompts = [f"What is {start + i} + {start + i + 1}?" for i in range(count)]
+            gts = [str(2 * (start + i) + 1) for i in range(count)]
             return prompts, gts
 
         dataset_len = len(self._dataset)
-        start = (step * num_prompts) % dataset_len
-        indices = [(start + i) % dataset_len for i in range(num_prompts)]
+        indices = [(start + i) % dataset_len for i in range(count)]
         samples = [self._dataset[idx] for idx in indices]
 
         prompts = []
         gts = []
         for s in samples:
-            prompt_raw = s.get("prompt") or s.get("question") or s.get("input") or ""
-            if isinstance(prompt_raw, list):
-                text_parts = [m.get("content", "") for m in prompt_raw if isinstance(m, dict)]
-                prompt_text = "\n".join(text_parts)
-            elif isinstance(prompt_raw, str) and prompt_raw.startswith("["):
-                try:
-                    msgs = _json.loads(prompt_raw)
-                    prompt_text = "\n".join(m.get("content", "") for m in msgs if isinstance(m, dict))
-                except (_json.JSONDecodeError, TypeError):
-                    prompt_text = prompt_raw
-            else:
-                prompt_text = str(prompt_raw)
-
-            rm_raw = s.get("reward_model", {})
-            if isinstance(rm_raw, str):
-                try:
-                    rm_raw = _json.loads(rm_raw)
-                except (_json.JSONDecodeError, TypeError):
-                    rm_raw = {}
-            if isinstance(rm_raw, dict):
-                gt = rm_raw.get("ground_truth", "")
-            else:
-                gt = s.get("answer") or s.get("solution") or s.get("target") or ""
-
-            if self._tokenizer is not None and hasattr(self._tokenizer, "apply_chat_template"):
-                raw = s.get("prompt") or s.get("question") or s.get("input") or ""
-                if isinstance(raw, list):
-                    try:
-                        prompt_text = self._tokenizer.apply_chat_template(
-                            raw, tokenize=False, add_generation_prompt=True,
-                        )
-                    except Exception:
-                        pass
-
-            prompts.append(prompt_text)
+            p, gt = self._extract_prompt_gt(s)
+            prompts.append(p)
             gts.append(gt)
-
         return prompts, gts
+
+    def _extract_prompt_gt(self, s: dict) -> tuple[str, str]:
+        """Extract (prompt_text, ground_truth) from a dataset row.
+
+        Shared by training (`_get_prompts_range`) and validation so the chat
+        template and ground-truth field (``reward_model.ground_truth``) are
+        parsed identically.
+        """
+        import json as _json
+
+        prompt_raw = s.get("prompt") or s.get("question") or s.get("input") or ""
+        if isinstance(prompt_raw, list):
+            prompt_text = "\n".join(m.get("content", "") for m in prompt_raw if isinstance(m, dict))
+        elif isinstance(prompt_raw, str) and prompt_raw.startswith("["):
+            try:
+                msgs = _json.loads(prompt_raw)
+                prompt_text = "\n".join(m.get("content", "") for m in msgs if isinstance(m, dict))
+            except (_json.JSONDecodeError, TypeError):
+                prompt_text = prompt_raw
+        else:
+            prompt_text = str(prompt_raw)
+
+        rm_raw = s.get("reward_model", {})
+        if isinstance(rm_raw, str):
+            try:
+                rm_raw = _json.loads(rm_raw)
+            except (_json.JSONDecodeError, TypeError):
+                rm_raw = {}
+        if isinstance(rm_raw, dict) and rm_raw.get("ground_truth", "") != "":
+            gt = rm_raw.get("ground_truth", "")
+        else:
+            gt = s.get("answer") or s.get("solution") or s.get("target") or ""
+
+        if self._tokenizer is not None and hasattr(self._tokenizer, "apply_chat_template"):
+            if isinstance(prompt_raw, list):
+                try:
+                    prompt_text = self._tokenizer.apply_chat_template(
+                        prompt_raw, tokenize=False, add_generation_prompt=True,
+                    )
+                except Exception:
+                    pass
+
+        return prompt_text, str(gt)
 
     def _tokenize_prompts(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize prompts to input_ids and attention_mask."""
@@ -701,9 +749,11 @@ class RLTrainer:
 
         t0 = time.time()
 
-        if self._rank == 0 and not self._atom_engine._sleeping:
+        # Non-persistent path frees the engine before gathering weights; the
+        # persistent path keeps it resident and reloads in place at the end.
+        if not self._vllm_persistent and self._rank == 0 and not self._atom_engine._sleeping:
             self._atom_engine.sleep_inprocess()
-            logger.info("Weight sync: ATOM engine released (in-process sleep).")
+            logger.info("Weight sync: inference engine released (in-process sleep).")
 
         if self._is_distributed:
             torch.distributed.barrier()
@@ -765,14 +815,29 @@ class RLTrainer:
                 len(cpu_state), sync_dir, save_time, total_bytes / 1e9,
             )
 
-            self._atom_engine._weight_dir = str(sync_dir)
-            logger.info("Weight sync: ATOM will reload from %s on next generation.", sync_dir)
+            logger.info("Weight sync: weights written to %s.", sync_dir)
 
         del cpu_state
         gc.collect()
 
         if self._is_distributed:
             torch.distributed.barrier()
+
+        # All ranks point their engine at the new weights.
+        self._atom_engine._weight_dir = str(sync_dir)
+
+        if self._vllm_persistent:
+            # In-place reload on every rank that runs a resident vLLM (no rebuild).
+            if self._vllm_dp or self._rank == 0:
+                try:
+                    self._atom_engine.reload_weights(str(sync_dir))
+                except Exception as exc:
+                    logger.warning(
+                        "Weight sync: in-place reload failed (%s); forcing rebuild next gen.", exc,
+                    )
+                    self._atom_engine.sleep()
+            if self._is_distributed:
+                torch.distributed.barrier()
 
     def _fetch_actor_cpu_state(self) -> dict[str, torch.Tensor] | None:
         """Fetch actor weights as CPU tensors for rollout sync."""
@@ -791,7 +856,13 @@ class RLTrainer:
         cpu_state: dict[str, torch.Tensor] = {}
         for name, param in sd.items():
             full = param.full_tensor() if isinstance(param, DTensor) else param
-            cpu_state[name] = full.detach().cpu().contiguous()
+            full = full.detach()
+            # Master weights are FP32; the rollout engine (vLLM) runs bf16, so
+            # downcast here to halve the sync payload and match its dtype.
+            # (Set LUMENRL_SYNC_FP32=1 to keep FP32, e.g. for weight-delta debug.)
+            if full.dtype == torch.float32 and os.environ.get("LUMENRL_SYNC_FP32") != "1":
+                full = full.to(torch.bfloat16)
+            cpu_state[name] = full.cpu().contiguous()
         return cpu_state
 
     def _rollout_with_atom(
@@ -898,6 +969,399 @@ class RLTrainer:
         prompt_lengths = prompt_encoding["attention_mask"].sum(dim=1).tolist()
 
         return sequences, seq_mask, prompt_lengths
+
+    def _rollout_with_vllm(
+        self,
+        prompts: list[str],
+        num_generations: int,
+        eval_mode: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor | None]:
+        """Generate with vanilla vLLM, returning rollout log-probs for TIS.
+
+        Builds sequences directly from vLLM token ids (prompt + response, right
+        padded) and a shifted ``rollout_log_probs`` tensor ``[B, S-1]`` aligned
+        with ``old_log_probs`` so token-level importance sampling correction can
+        be applied. Only rank 0 generates; everything is broadcast to all ranks.
+
+        Returns ``(sequences, seq_mask, prompt_lengths, rollout_log_probs)`` where
+        ``rollout_log_probs`` is ``None`` when log-probs were not requested.
+        """
+        algo_name = self.config.algorithm.name.lower()
+        vcfg = self.config.policy.generation.vllm_cfg
+        max_total = int(self.config.policy.max_total_sequence_length)
+        max_resp = int(self.config.policy.max_response_length)
+        max_tok = max_resp if max_resp > 0 else max(128, max_total // 2)
+
+        if eval_mode:
+            # Validation sampling aligned with verl val_kwargs
+            # (temperature=0.6, top_p=1.0, top_k=-1, n=1); no rollout log-probs.
+            sp: dict[str, Any] = {"max_tokens": max_tok, "temperature": 0.6, "top_p": 1.0, "top_k": -1}
+        else:
+            sp = {
+                "max_tokens": max_tok,
+                "temperature": float(vcfg.temperature),
+                "top_p": float(vcfg.top_p),
+                "top_k": int(vcfg.top_k),
+            }
+            if algo_name in ("dapo", "grpo") and vcfg.temperature == 0.0:
+                sp["temperature"] = 1.0
+
+        expanded_prompts = [p for p in prompts for _ in range(num_generations)]
+        pad_id = self._tokenizer.pad_token_id or 0
+        want_lp = bool(vcfg.calculate_log_probs) and not eval_mode
+
+        def _wake() -> None:
+            eng = self._atom_engine
+            if eng._sleeping:
+                mp = eng._weight_dir or eng._model_name
+                eng._send_cmd({"cmd": "wake", "model_path": mp})
+                eng._sleeping = False
+            elif not getattr(eng, "_initialized", False):
+                eng.wake()
+
+        def _build(results: list[dict]) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor | None]:
+            """Left-pad vLLM token outputs into (sequences, mask, plens, rollout_lp)."""
+            seqs: list[list[int]] = []
+            lps: list[list[float]] = []
+            plens: list[int] = []
+            for r in results:
+                p_ids = list(r["prompt_token_ids"])
+                r_ids = list(r["token_ids"])
+                r_lp = r.get("logprobs")
+                budget = max(1, max_total - len(p_ids))
+                if len(r_ids) > budget:
+                    r_ids = r_ids[:budget]
+                    if r_lp is not None:
+                        r_lp = r_lp[:budget]
+                seqs.append(p_ids + r_ids)
+                plens.append(len(p_ids))
+                lps.append(r_lp if r_lp is not None else [0.0] * len(r_ids))
+
+            S = max((len(s) for s in seqs), default=1)
+            B = len(seqs)
+            sequences = torch.full((B, S), pad_id, dtype=torch.long)
+            seq_mask = torch.zeros((B, S), dtype=torch.long)
+            rlp = torch.zeros((B, max(1, S - 1)), dtype=torch.float32) if want_lp else None
+            # LEFT-pad (real tokens at the right end) to match pack_sequences /
+            # unpack_log_probs / _build_response_mask.
+            for i, s in enumerate(seqs):
+                L = len(s)
+                off = S - L
+                sequences[i, off:off + L] = torch.tensor(s, dtype=torch.long)
+                seq_mask[i, off:off + L] = 1
+                if want_lp:
+                    plen = plens[i]
+                    for j, lp in enumerate(lps[i]):
+                        idx = off + plen + j - 1
+                        if 0 <= idx < rlp.shape[1]:
+                            rlp[i, idx] = lp
+            return (
+                sequences.to(self._device), seq_mask.to(self._device), plens,
+                (rlp.to(self._device) if rlp is not None else None),
+            )
+
+        # ---- Data-parallel rollout: each rank generates its own shard. ----
+        if self._vllm_dp and self._is_distributed and self._world_size > 1:
+            N = len(expanded_prompts)
+            ws = self._world_size
+            chunk = (N + ws - 1) // ws
+            s_idx = min(N, self._rank * chunk)
+            e_idx = min(N, s_idx + chunk)
+            local_prompts = expanded_prompts[s_idx:e_idx]
+            _wake()
+            if local_prompts:
+                results = self._atom_engine.generate_with_logprobs(
+                    local_prompts, sampling_params=sp, want_logprobs=want_lp,
+                )
+                lseq, lmask, lplens, llp = _build(results)
+            else:
+                lseq = torch.zeros(0, 1, dtype=torch.long, device=self._device)
+                lmask = torch.zeros(0, 1, dtype=torch.long, device=self._device)
+                lplens = []
+                llp = torch.zeros(0, 1, dtype=torch.float32, device=self._device) if want_lp else None
+            return self._allgather_vllm(lseq, lmask, llp, lplens, want_lp, pad_id)
+
+        # ---- Single-GPU rollout: rank 0 generates, broadcast to all ranks. ----
+        if self._rank == 0:
+            _wake()
+            results = self._atom_engine.generate_with_logprobs(
+                expanded_prompts, sampling_params=sp, want_logprobs=want_lp,
+            )
+            sequences, seq_mask, plens, rollout_lp = _build(results)
+        else:
+            sequences = torch.zeros(1, 1, dtype=torch.long, device=self._device)
+            seq_mask = torch.zeros(1, 1, dtype=torch.long, device=self._device)
+            rollout_lp = None
+            plens = []
+
+        if self._is_distributed:
+            torch.distributed.barrier()
+            meta_t = torch.tensor(
+                [sequences.shape[0], sequences.shape[1], 1 if want_lp else 0],
+                device=self._device, dtype=torch.long,
+            )
+            torch.distributed.broadcast(meta_t, src=0)
+            B, S, lp_flag = int(meta_t[0]), int(meta_t[1]), int(meta_t[2])
+            if self._rank != 0:
+                sequences = torch.zeros(B, S, dtype=torch.long, device=self._device)
+                seq_mask = torch.zeros(B, S, dtype=torch.long, device=self._device)
+                rollout_lp = torch.zeros(B, max(1, S - 1), dtype=torch.float32, device=self._device) if lp_flag else None
+            torch.distributed.broadcast(sequences, src=0)
+            torch.distributed.broadcast(seq_mask, src=0)
+            if lp_flag:
+                torch.distributed.broadcast(rollout_lp, src=0)
+            plen_t = torch.tensor(plens, device=self._device, dtype=torch.long) if self._rank == 0 else torch.zeros(B, dtype=torch.long, device=self._device)
+            if self._rank == 0 and plen_t.shape[0] != B:
+                plen_t = torch.zeros(B, dtype=torch.long, device=self._device)
+            torch.distributed.broadcast(plen_t, src=0)
+            prompt_lengths = plen_t.tolist()
+        else:
+            prompt_lengths = plens
+
+        return sequences, seq_mask, prompt_lengths, rollout_lp
+
+    def _allgather_vllm(
+        self,
+        lseq: torch.Tensor,
+        lmask: torch.Tensor,
+        llp: torch.Tensor | None,
+        lplens: list[int],
+        want_lp: bool,
+        pad_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor | None]:
+        """All-gather per-rank LEFT-padded rollout shards into the full ordered batch.
+
+        Each rank contributes ``lseq[n_r, S_r]`` (+ mask, lp[n_r, S_r-1], plens);
+        we pad to global max width (LEFT, prepend) and max row count, all-gather,
+        then trim per-rank counts and concat in rank order.
+        """
+        import torch.distributed as dist
+        dev = self._device
+        ws = self._world_size
+
+        n_r = lseq.shape[0]
+        S_r = lseq.shape[1]
+        # Global max width and per-rank counts.
+        wmax = torch.tensor([S_r], device=dev, dtype=torch.long)
+        dist.all_reduce(wmax, op=dist.ReduceOp.MAX)
+        S = int(wmax.item())
+        cnt = torch.tensor([n_r], device=dev, dtype=torch.long)
+        counts = [torch.zeros_like(cnt) for _ in range(ws)]
+        dist.all_gather(counts, cnt)
+        counts = [int(c.item()) for c in counts]
+        max_n = max(counts) if counts else 0
+        if max_n == 0:
+            empty = torch.zeros(0, S, dtype=torch.long, device=dev)
+            return empty, empty.clone(), [], (torch.zeros(0, max(1, S - 1), device=dev) if want_lp else None)
+
+        def _lpad_cols(t: torch.Tensor, width: int, value) -> torch.Tensor:
+            if t.shape[1] >= width:
+                return t
+            pad = torch.full((t.shape[0], width - t.shape[1]), value, dtype=t.dtype, device=t.device)
+            return torch.cat([pad, t], dim=1)
+
+        def _pad_rows(t: torch.Tensor, rows: int) -> torch.Tensor:
+            if t.shape[0] >= rows:
+                return t
+            pad = torch.zeros((rows - t.shape[0], t.shape[1]), dtype=t.dtype, device=t.device)
+            return torch.cat([t, pad], dim=0)
+
+        seq_pad = _pad_rows(_lpad_cols(lseq, S, pad_id), max_n)
+        mask_pad = _pad_rows(_lpad_cols(lmask, S, 0), max_n)
+        seq_g = [torch.zeros(max_n, S, dtype=torch.long, device=dev) for _ in range(ws)]
+        mask_g = [torch.zeros(max_n, S, dtype=torch.long, device=dev) for _ in range(ws)]
+        dist.all_gather(seq_g, seq_pad)
+        dist.all_gather(mask_g, mask_pad)
+
+        if want_lp:
+            lp_pad = _pad_rows(_lpad_cols(llp if llp is not None else torch.zeros(n_r, max(1, S - 1), device=dev), S - 1, 0.0), max_n)
+            lp_g = [torch.zeros(max_n, max(1, S - 1), dtype=torch.float32, device=dev) for _ in range(ws)]
+            dist.all_gather(lp_g, lp_pad)
+
+        plen_local = torch.zeros(max_n, dtype=torch.long, device=dev)
+        if n_r > 0:
+            plen_local[:n_r] = torch.tensor(lplens, dtype=torch.long, device=dev)
+        plen_g = [torch.zeros(max_n, dtype=torch.long, device=dev) for _ in range(ws)]
+        dist.all_gather(plen_g, plen_local)
+
+        seqs, masks, lps, plens = [], [], [], []
+        for r in range(ws):
+            c = counts[r]
+            if c == 0:
+                continue
+            seqs.append(seq_g[r][:c])
+            masks.append(mask_g[r][:c])
+            if want_lp:
+                lps.append(lp_g[r][:c])
+            plens.extend(plen_g[r][:c].tolist())
+        sequences = torch.cat(seqs, dim=0)
+        seq_mask = torch.cat(masks, dim=0)
+        rollout_lp = torch.cat(lps, dim=0) if want_lp else None
+        return sequences, seq_mask, plens, rollout_lp
+
+    def _compute_rewards_full(
+        self,
+        sequences: torch.Tensor,
+        prompt_lengths: list[int],
+        gts_expanded: list[str],
+    ) -> tuple[torch.Tensor, list[str], list[float]]:
+        """Compute rewards + accuracy on the FULL (unsharded) rollout set.
+
+        Rank 0 decodes and scores; ``rewards`` and ``acc`` are broadcast so every
+        rank can run identical dynamic-sampling filtering. Returns
+        ``(rewards [N] on device, responses, acc [N] floats)``.
+        """
+        from lumenrl.rewards.math_reward import compute_math_reward
+
+        N = int(sequences.shape[0])
+        responses: list[str] = []
+        if self._rank == 0:
+            seq_cpu = sequences.cpu()
+            for i in range(N):
+                plen = int(prompt_lengths[i]) if i < len(prompt_lengths) else 0
+                text = self._tokenizer.decode(seq_cpu[i, plen:], skip_special_tokens=True)
+                responses.append(text)
+            rewards_t, details = compute_math_reward(responses, gts_expanded)
+            rewards = rewards_t.to(self._device)
+            accs = torch.tensor(
+                [1.0 if d["acc"] else 0.0 for d in details],
+                dtype=torch.float32, device=self._device,
+            )
+            acc_frac = float(accs.mean().item()) if N else 0.0
+            logger.info("Rollout reward: N=%d accuracy=%.4f mean=%.4f", N, acc_frac, float(rewards.mean().item()))
+        else:
+            rewards = torch.zeros(N, dtype=torch.float32, device=self._device)
+            accs = torch.zeros(N, dtype=torch.float32, device=self._device)
+
+        if self._is_distributed:
+            torch.distributed.broadcast(rewards, src=0)
+            torch.distributed.broadcast(accs, src=0)
+        return rewards, responses, accs.tolist()
+
+    def _collect_rollout_batch(
+        self, step: int, num_generations: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor, list[str], list[str], torch.Tensor | None]:
+        """Generate the full (unsharded) rollout batch for one training step.
+
+        Handles DAPO dynamic sampling (verl ``filter_groups``): when enabled,
+        over-samples ``policy.gen_batch_size`` prompts per round, drops prompt
+        groups whose per-prompt ``acc`` has zero variance, and keeps generating
+        up to ``filter_groups.max_num_gen_batches`` rounds until
+        ``train_global_batch_size // num_generations`` valid prompt groups are
+        collected. Returns full-set tensors identical on every rank:
+        ``(sequences, seq_mask, prompt_lengths, rewards, responses, gts_expanded,
+        rollout_log_probs)``.
+        """
+        from lumenrl.algorithms.dapo_sampling import filter_groups_keep_mask
+
+        g = num_generations
+        pol = self.config.policy
+        train_prompts = max(1, pol.train_global_batch_size // g)
+        algo_lc = self.config.algorithm.name.lower()
+        fg = getattr(self.config.algorithm.dapo, "filter_groups", None) if algo_lc == "dapo" else None
+        use_filter = bool(fg is not None and fg.enable)
+
+        gen_prompts = int(pol.gen_batch_size) if pol.gen_batch_size > 0 else train_prompts
+        if not use_filter:
+            gen_prompts = train_prompts
+
+        def _one_round(prompts: list[str]):
+            if self._use_vllm:
+                seqs, mask, plen, lp = self._rollout_with_vllm(prompts, g)
+            elif self._use_atom and self._atom_engine is not None:
+                seqs, mask, plen = self._rollout_with_atom(prompts, g)
+                lp = None
+            else:
+                ids, am = self._tokenize_prompts(prompts)
+                seqs, mask, plen = self._rollout_phase(ids, am, g)
+                lp = None
+            return seqs, mask, plen, lp
+
+        # Simple (no dynamic sampling) path: one round, return everything.
+        if not use_filter:
+            prompts, gts = self._get_prompts_range(self._prompt_cursor, gen_prompts)
+            self._prompt_cursor += gen_prompts
+            seqs, mask, plen, lp = _one_round(prompts)
+            gts_exp = [gt for gt in gts for _ in range(g)]
+            rewards, responses, _accs = self._compute_rewards_full(seqs, plen, gts_exp)
+            return seqs, mask, plen, rewards, responses, gts_exp, lp
+
+        # Dynamic-sampling regeneration loop (verl filter_groups).
+        acc_rows: list[torch.Tensor] = []
+        acc_mask: list[torch.Tensor] = []
+        acc_lp: list[torch.Tensor] = []
+        acc_plen: list[int] = []
+        acc_rewards: list[torch.Tensor] = []
+        acc_gts: list[str] = []
+        kept_prompts = 0
+        rounds = 0
+        max_rounds = fg.max_num_gen_batches if fg.max_num_gen_batches > 0 else 10_000
+        want_lp = self._use_vllm and self.config.policy.generation.vllm_cfg.calculate_log_probs
+
+        while kept_prompts < train_prompts and rounds < max_rounds:
+            rounds += 1
+            prompts, gts = self._get_prompts_range(self._prompt_cursor, gen_prompts)
+            self._prompt_cursor += gen_prompts
+            seqs, mask, plen, lp = _one_round(prompts)
+            gts_exp = [gt for gt in gts for _ in range(g)]
+            rewards, _responses, accs = self._compute_rewards_full(seqs, plen, gts_exp)
+
+            uids = [i // g for i in range(seqs.shape[0])]
+            keep_mask, kept_uids = filter_groups_keep_mask(accs, uids)
+            kept_idx = [i for i, k in enumerate(keep_mask.tolist()) if k]
+            if kept_idx:
+                acc_rows.append(seqs[kept_idx])
+                acc_mask.append(mask[kept_idx])
+                acc_rewards.append(rewards[kept_idx])
+                if want_lp and lp is not None:
+                    acc_lp.append(lp[kept_idx])
+                acc_plen.extend([int(plen[i]) for i in kept_idx])
+                acc_gts.extend([gts_exp[i] for i in kept_idx])
+                kept_prompts += len(kept_uids)
+            if self._rank == 0:
+                logger.info(
+                    "[step %d] filter_groups round %d: kept %d/%d prompt groups (total %d/%d)",
+                    step, rounds, len(kept_uids), gen_prompts, kept_prompts, train_prompts,
+                )
+
+        if not acc_rows:
+            raise RuntimeError("filter_groups collected no valid groups; check data difficulty / max_num_gen_batches.")
+
+        # LEFT-pad every round to a common sequence length and concatenate.
+        # Sequences are left-padded (real tokens at the right end), so widening
+        # must prepend pad columns to preserve right-alignment for pack_sequences.
+        S_max = max(t.shape[1] for t in acc_rows)
+        pad_id = self._tokenizer.pad_token_id or 0
+
+        def _lpad(t: torch.Tensor, width: int, value: float) -> torch.Tensor:
+            if t.shape[1] >= width:
+                return t[:, t.shape[1] - width:]
+            pad = torch.full((t.shape[0], width - t.shape[1]), value, dtype=t.dtype, device=t.device)
+            return torch.cat([pad, t], dim=1)
+
+        sequences = torch.cat([_lpad(t, S_max, pad_id) for t in acc_rows], dim=0)
+        seq_mask = torch.cat([_lpad(t, S_max, 0) for t in acc_mask], dim=0)
+        rewards = torch.cat(acc_rewards, dim=0)
+        rollout_lp = torch.cat([_lpad(t, S_max - 1, 0.0) for t in acc_lp], dim=0) if acc_lp else None
+
+        # Truncate to exactly train_prompts groups (whole groups of g rows each).
+        keep_rows = train_prompts * g
+        sequences = sequences[:keep_rows]
+        seq_mask = seq_mask[:keep_rows]
+        rewards = rewards[:keep_rows]
+        prompt_lengths = acc_plen[:keep_rows]
+        gts_exp = acc_gts[:keep_rows]
+        if rollout_lp is not None:
+            rollout_lp = rollout_lp[:keep_rows]
+
+        responses: list[str] = []
+        if self._rank == 0:
+            seq_cpu = sequences.cpu()
+            for i in range(sequences.shape[0]):
+                plen = prompt_lengths[i] if i < len(prompt_lengths) else 0
+                responses.append(self._tokenizer.decode(seq_cpu[i, plen:], skip_special_tokens=True))
+
+        return sequences, seq_mask, prompt_lengths, rewards, responses, gts_exp, rollout_lp
 
     def _set_reshard(self, reshard: bool) -> None:
         """Toggle FSDP2 reshard_after_forward on the actor model."""
@@ -1340,7 +1804,7 @@ class RLTrainer:
 
         from lumenrl.engine.training.packing import (
             PackingContext, pack_sequences, packed_token_log_probs,
-            unpack_log_probs,
+            packed_token_entropy, unpack_log_probs,
         )
 
         self._actor_model.train()
@@ -1355,7 +1819,14 @@ class RLTrainer:
             _local_mb_tokens = int(_resp.sum())
         else:
             _local_mb_tokens = int(attention_mask.sum())
-        if self._is_distributed:
+        # Prefer the full-batch global token count (set by the trainer when
+        # accumulating gradients across mini-batches into one optimizer step) so
+        # token-mean normalization matches verl. Fall back to the per-mini-batch
+        # global count when training a standalone batch.
+        _full_bt = batch.meta.get("full_batch_num_tokens")
+        if _full_bt is not None:
+            mb_batch_num_tokens = int(_full_bt)
+        elif self._is_distributed:
             _tok_t = torch.tensor(_local_mb_tokens, device=self._device)
             torch.distributed.all_reduce(_tok_t, op=torch.distributed.ReduceOp.SUM)
             mb_batch_num_tokens = int(_tok_t.item())
@@ -1378,6 +1849,20 @@ class RLTrainer:
             flat_lp = packed_token_log_probs(
                 logits, packed.input_ids.squeeze(0), packed.cu_seqlens,
             )
+            # Predictive entropy (metric only, detached) over response tokens.
+            _entropy_mean = None
+            try:
+                _ent_flat = packed_token_entropy(logits.detach(), packed.cu_seqlens)
+                _ent_unpacked = unpack_log_probs(
+                    _ent_flat, packed.cu_seqlens, packed.seq_lens, sequences.shape[1],
+                )
+                if _resp is not None:
+                    _rm_e = _resp.to(dtype=_ent_unpacked.dtype)
+                    _entropy_mean = float((_ent_unpacked * _rm_e).sum() / _rm_e.sum().clamp(min=1.0))
+                else:
+                    _entropy_mean = float(_ent_unpacked.mean())
+            except Exception:
+                _entropy_mean = None
             del outputs, logits
 
             # Unpack to [B, S-1] padded format (matches old_log_probs shape)
@@ -1386,15 +1871,22 @@ class RLTrainer:
             )
             batch.tensors["log_probs"] = token_log_probs
 
-            # Mismatch KL: divergence between rollout (old) and training log_probs.
-            # Should be ~0 when both use the same computation path and policy.
+            # Mismatch KL: divergence between the *rollout* policy (vLLM
+            # rollout_log_probs) and the current training log_probs — i.e. the
+            # train/inference policy gap that TIS corrects (verl rollout_corr/kl
+            # sign: rollout - train). When rollout_log_probs are unavailable
+            # (e.g. ATOM text rollout) this falls back to old_log_probs, which is
+            # the train-side self-consistency check (~0 at the first micro-batch).
+            _ref_lp = batch.tensors.get("rollout_log_probs")
+            if _ref_lp is None:
+                _ref_lp = batch.tensors["old_log_probs"]
             if _resp is not None:
-                _diff = (token_log_probs - batch.tensors["old_log_probs"]).detach()
+                _diff = (_ref_lp - token_log_probs).detach()
                 _rm = _resp.to(dtype=_diff.dtype)
                 _denom = _rm.sum().clamp(min=1.0)
                 _mismatch_kl = float((_diff * _rm).sum() / _denom)
             else:
-                _mismatch_kl = float((token_log_probs - batch.tensors["old_log_probs"]).detach().mean())
+                _mismatch_kl = float((_ref_lp - token_log_probs).detach().mean())
 
             # Attach per-mini-batch global normalization info for Verl-aligned loss
             batch.meta["batch_num_tokens"] = mb_batch_num_tokens
@@ -1413,6 +1905,8 @@ class RLTrainer:
 
         metrics["loss"] = float(loss.detach())
         metrics["mismatch_kl"] = _mismatch_kl
+        if _entropy_mean is not None:
+            metrics["entropy"] = _entropy_mean
         return metrics
 
     def train(self) -> None:
@@ -1434,6 +1928,12 @@ class RLTrainer:
         if start_step > 0:
             logger.info("[rank %d] Skipping steps 0..%d (resuming from checkpoint).", self._rank, start_step - 1)
 
+        # Advance the dynamic-sampling prompt cursor to roughly where a resumed
+        # run left off (per-round granularity; exact alignment isn't required).
+        _train_prompts = max(1, self.config.policy.train_global_batch_size // max(1, num_generations))
+        _gp = int(self.config.policy.gen_batch_size) if self.config.policy.gen_batch_size > 0 else _train_prompts
+        self._prompt_cursor = start_step * _gp
+
         for step in range(start_step, total_steps):
             step_start = time.time()
             self.global_step = step
@@ -1442,40 +1942,39 @@ class RLTrainer:
                 for cb in self.callbacks:
                     cb.on_step_begin(self, step)
 
-            prompts, ground_truths = self._get_batch_prompts(step)
-            input_ids, attention_mask = self._tokenize_prompts(prompts)
-
             if self._use_atom and self._atom_engine is not None:
                 self._offload_optimizer_to_cpu()
 
             self._log_gpu_mem("pre_gen", step)
             t0 = time.time()
-            if self._use_atom and self._atom_engine is not None:
-                sequences, seq_mask, prompt_lengths = self._rollout_with_atom(
-                    prompts, num_generations,
-                )
-            else:
-                sequences, seq_mask, prompt_lengths = self._rollout_phase(
-                    input_ids, attention_mask, num_generations,
-                )
+            # Full (unsharded) rollout batch. Handles DAPO dynamic sampling
+            # (filter_groups) + rollout log-probs internally; rewards are
+            # computed once on the full set so degenerate groups can be filtered.
+            (sequences, seq_mask, prompt_lengths, rewards_full,
+             responses_full, gts_exp_full, rollout_lp_full) = self._collect_rollout_batch(
+                step, num_generations,
+            )
             gen_time = time.time() - t0
             self._log_gpu_mem("post_gen", step)
 
-            if self._use_atom and self._atom_engine is not None and self._rank == 0:
-                if not self._atom_engine._sleeping:
+            # Persistent vLLM stays resident across steps (memory coexists with
+            # FSDP training); only the kill/sleep-based path frees after gen.
+            if self._use_atom and self._atom_engine is not None and not self._vllm_persistent:
+                _engine_ranks = self._vllm_dp or self._rank == 0
+                if _engine_ranks and not self._atom_engine._sleeping:
                     self._atom_engine.sleep_inprocess()
-                    logger.info("ATOM slept after generation — freeing GPU 0 for training.")
+                    logger.info("Inference engine slept after generation — freeing GPU for training.")
             if self._use_atom and self._is_distributed:
                 torch.distributed.barrier()
             torch.cuda.empty_cache()
             self._log_gpu_mem("post_atom_sleep", step)
 
-            prompt_tok = int(attention_mask.repeat_interleave(
-                num_generations, dim=0).to(seq_mask.device).sum().item()) if num_generations > 0 else 0
+            prompt_tok = sum(int(p) for p in prompt_lengths) if num_generations > 0 else 0
             gen_tokens = int(seq_mask.sum().item()) - prompt_tok if num_generations > 0 else 0
 
-            # Shard sequences to per-rank for log-prob computation and training.
-            # FSDP2 does gradient all-reduce; each rank only needs its own shard.
+            # Shard the (already full) sequence-level batch per rank for log-prob
+            # computation and training. Every tensor/list below is sequence-level
+            # (length N), so they share one slice. FSDP2 all-reduces gradients.
             if self._is_distributed and self._world_size > 1:
                 _total = sequences.shape[0]
                 _chunk = max(1, _total // self._world_size)
@@ -1483,15 +1982,14 @@ class RLTrainer:
                 _e = _s + _chunk if self._rank < self._world_size - 1 else _total
                 sequences = sequences[_s:_e]
                 seq_mask = seq_mask[_s:_e]
+                rewards_full = rewards_full[_s:_e]
+                if rollout_lp_full is not None:
+                    rollout_lp_full = rollout_lp_full[_s:_e]
                 if isinstance(prompt_lengths, list):
                     prompt_lengths = prompt_lengths[_s:_e]
-                # ground_truths is prompt-level (N_prompts), not sequence-level
-                _n_prompts = len(ground_truths) if isinstance(ground_truths, list) else 0
-                if _n_prompts > 0:
-                    _p_chunk = max(1, _n_prompts // self._world_size)
-                    _ps = self._rank * _p_chunk
-                    _pe = _ps + _p_chunk if self._rank < self._world_size - 1 else _n_prompts
-                    ground_truths = ground_truths[_ps:_pe]
+                gts_exp_full = gts_exp_full[_s:_e]
+                if responses_full:
+                    responses_full = responses_full[_s:_e]
 
             self._actor_model.eval()
             old_log_probs = self._compute_log_probs_for_model(
@@ -1525,29 +2023,36 @@ class RLTrainer:
                 ref_log_probs = torch.zeros_like(old_log_probs)
             ref_time = time.time() - t1
 
-            rewards, responses = self._compute_rewards(
-                sequences, prompt_lengths, ground_truths, num_generations,
-            )
+            # Rewards were computed on the full set inside _collect_rollout_batch.
+            rewards = rewards_full.to(self._device)
+            responses = responses_full
 
             response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
             response_lengths = [
                 int(response_mask[i].sum().item()) for i in range(response_mask.shape[0])
             ]
 
+            _batch_tensors = {
+                "input_ids": sequences,
+                "attention_mask": seq_mask,
+                "old_log_probs": old_log_probs,
+                "ref_log_probs": ref_log_probs,
+                "rewards": rewards,
+                "response_mask": response_mask,
+            }
+            # Rollout log-probs (vLLM) enable TIS/MIS rollout correction.
+            if rollout_lp_full is not None:
+                _rlp = rollout_lp_full.to(self._device)
+                if _rlp.shape == old_log_probs.shape:
+                    _batch_tensors["rollout_log_probs"] = _rlp
+
             batch = DataProto(
-                tensors={
-                    "input_ids": sequences,
-                    "attention_mask": seq_mask,
-                    "old_log_probs": old_log_probs,
-                    "ref_log_probs": ref_log_probs,
-                    "rewards": rewards,
-                    "response_mask": response_mask,
-                },
+                tensors=_batch_tensors,
                 meta={
                     "algorithm": self.config.algorithm.name,
                     "response_lengths": response_lengths,
                     "responses": responses,
-                    "ground_truths": ground_truths * num_generations,
+                    "ground_truths": gts_exp_full,
                 },
             )
 
@@ -1616,18 +2121,33 @@ class RLTrainer:
             metrics_accum: dict[str, float] = {}
             step_count = 0
             nan_mb_count = 0
-            grad_norm = 0.0
+            grad_norm = 0.0          # running SUM of per-optimizer-step grad norms
             mismatch_kl_initial: float | None = None
             nan_param_count = 0
             total_param_count = 0
             optimizer_steps = 0
 
-            accum_steps = 1
+            accum_steps = 1   # set per-epoch below to len(mini_batches)
             _dp_size = self._world_size if self._is_distributed else 1
             self._update_lr(step)
             _cur_lr = self._optimizer.param_groups[0]["lr"]
 
-            _fsdp_grad_sync = accum_steps > 1 and self._is_distributed
+            # verl-aligned update procedure: accumulate gradients over ALL
+            # token-budget mini-batches and take ONE optimizer step per training
+            # step, normalized by the full-batch token count. Doing a separate
+            # optimizer step per (length-sorted) mini-batch instead biases the
+            # update toward short sequences (later chunks get PPO-clipped after
+            # the first step), which stalls response-length growth and learning.
+            _resp_full = batch.tensors.get("response_mask")
+            _local_full = int(_resp_full.sum()) if _resp_full is not None else int(batch.tensors["attention_mask"].sum())
+            if self._is_distributed:
+                _ft = torch.tensor(_local_full, device=self._device)
+                torch.distributed.all_reduce(_ft, op=torch.distributed.ReduceOp.SUM)
+                batch.meta["full_batch_num_tokens"] = int(_ft.item())
+            else:
+                batch.meta["full_batch_num_tokens"] = _local_full
+
+            _fsdp_grad_sync = self._is_distributed and self._world_size > 1
             if _fsdp_grad_sync:
                 from lumenrl.engine.training.fsdp_backend import set_requires_gradient_sync
 
@@ -1658,6 +2178,11 @@ class RLTrainer:
                         logger.info("[rank %d] Padded mini-batches: %d -> %d for FSDP2 sync",
                                     self._rank, my_count, global_max)
 
+                # ONE optimizer step per training step: accumulate over all
+                # mini-batches. Token-mean normalization uses the full-batch
+                # token count, so no 1/N loss scaling is applied.
+                accum_steps = max(1, len(mini_batches))
+
                 if self._rank == 0:
                     logger.info(
                         "[step %d epoch %d/%d] Training: %d mini-batches, accum_steps=%d, dp_size=%d, lr=%.2e",
@@ -1672,7 +2197,7 @@ class RLTrainer:
                             self._optimizer.zero_grad(set_to_none=True)
                     group_start = (i // accum_steps) * accum_steps
                     group_size = min(accum_steps, len(mini_batches) - group_start)
-                    cur_loss_scale = 1.0 / group_size
+                    cur_loss_scale = 1.0  # full-batch token-mean handles averaging
                     is_last_in_group = (i + 1) % accum_steps == 0 or i == len(mini_batches) - 1
                     if _fsdp_grad_sync:
                         set_requires_gradient_sync(self._actor_model, is_last_in_group)
@@ -1696,7 +2221,7 @@ class RLTrainer:
                                     self._optimizer.zero_grad(set_to_none=True)
                                 else:
                                     self._optimizer.step()
-                            grad_norm = max(grad_norm, _gn)
+                            grad_norm += _gn  # mean over optimizer steps (verl-aligned)
                             optimizer_steps += 1
                         continue
                     _nan_cnt = 0
@@ -1722,7 +2247,7 @@ class RLTrainer:
                                 self._optimizer.zero_grad(set_to_none=True)
                             else:
                                 self._optimizer.step()
-                        grad_norm = max(grad_norm, _gn)
+                        grad_norm += _gn  # mean over optimizer steps (verl-aligned)
                         optimizer_steps += 1
                     if mismatch_kl_initial is None and "mismatch_kl" in m:
                         mismatch_kl_initial = m["mismatch_kl"]
@@ -1758,7 +2283,9 @@ class RLTrainer:
 
             denom = max(1, step_count)
             metrics = {k: v / denom for k, v in metrics_accum.items()}
-            metrics["grad_norm"] = float(grad_norm)
+            # Mean grad norm over optimizer steps (verl reports the mean across
+            # mini-batches, not the max).
+            metrics["grad_norm"] = float(grad_norm / max(1, optimizer_steps))
             metrics["nan_params"] = nan_param_count
             if mismatch_kl_initial is not None:
                 metrics["mismatch_kl"] = mismatch_kl_initial
@@ -2020,99 +2547,102 @@ class RLTrainer:
             self._sync_weights_to_atom()
 
     def run_validation(self) -> dict[str, float]:
-        """Run validation: generate responses, compute rewards, aggregate metrics."""
+        """Evaluate on the validation set with greedy decoding.
+
+        Reports verl-style ``val-core/acc/mean@1`` (fraction correct) plus mean
+        reward and response length. Generation is colocated (rank 0 generates via
+        the inference engine, broadcast to all ranks) so every rank computes
+        identical metrics. Capped at ``eval.num_samples`` to keep frequent eval
+        cheap.
+        """
         if self._val_dataset is None or len(self._val_dataset) == 0:
             return {}
 
-        val_bs = getattr(self.config, 'val_batch_size', 16)
+        from lumenrl.rewards.math_reward import compute_math_reward
+
+        val_bs = max(1, int(getattr(self.config, "val_batch_size", 16)))
+        cap = int(getattr(self.config.eval, "num_samples", 0) or 0)
         num_samples = len(self._val_dataset)
+        if cap > 0:
+            num_samples = min(num_samples, cap)
+
         all_scores: list[float] = []
+        all_acc: list[float] = []
         all_response_lengths: list[int] = []
         all_responses: list[str] = []
 
-        # Iterate through validation dataset in batches
+        if self._rank == 0:
+            logger.info("[eval] step=%d: evaluating %d val samples (greedy)", self.global_step + 1, num_samples)
+
         for start in range(0, num_samples, val_bs):
             end = min(start + val_bs, num_samples)
-            indices = list(range(start, end))
-            samples = [self._val_dataset[idx] for idx in indices]
-
-            # Extract prompts and ground truths (same logic as _get_batch_prompts)
-            import json as _json
-            prompts: list[str] = []
-            ground_truths: list[str] = []
+            samples = [self._val_dataset[idx] for idx in range(start, end)]
+            prompts, ground_truths = [], []
             for s in samples:
-                raw = s.get("prompt") or s.get("question") or s.get("input") or ""
-                if isinstance(raw, list):
-                    text = "\n".join(m.get("content", "") for m in raw if isinstance(m, dict))
-                elif isinstance(raw, str) and raw.startswith("["):
-                    try:
-                        msgs = _json.loads(raw)
-                        text = "\n".join(m.get("content", "") for m in msgs if isinstance(m, dict))
-                    except (_json.JSONDecodeError, TypeError):
-                        text = raw
-                else:
-                    text = str(raw)
+                p, gt = self._extract_prompt_gt(s)
+                prompts.append(p)
+                ground_truths.append(gt)
 
-                if self._tokenizer is not None and hasattr(self._tokenizer, "apply_chat_template"):
-                    orig = s.get("prompt") or s.get("question") or s.get("input") or ""
-                    if isinstance(orig, list):
-                        try:
-                            text = self._tokenizer.apply_chat_template(orig, tokenize=False, add_generation_prompt=True)
-                        except Exception:
-                            pass
-
-                prompts.append(text)
-                gt = s.get("answer") or s.get("ground_truth") or s.get("solution") or ""
-                ground_truths.append(str(gt))
-
-            input_ids, attention_mask = self._tokenize_prompts(prompts)
-
-            # Generate with greedy decoding for reproducibility
-            if self._use_atom and self._atom_engine is not None:
+            # Greedy eval generation (colocated, broadcast to all ranks).
+            if self._use_vllm and self._atom_engine is not None:
+                sequences, seq_mask, prompt_lengths, _ = self._rollout_with_vllm(
+                    prompts, num_generations=1, eval_mode=True,
+                )
+            elif self._use_atom and self._atom_engine is not None:
                 sequences, seq_mask, prompt_lengths = self._rollout_with_atom(prompts, num_generations=1)
             else:
+                input_ids, attention_mask = self._tokenize_prompts(prompts)
                 sequences, seq_mask, prompt_lengths = self._rollout_phase(input_ids, attention_mask, num_generations=1)
 
-            # Compute rewards
-            rewards, responses = self._compute_rewards(sequences, prompt_lengths, ground_truths, num_generations=1)
+            # Decode + score (identical on every rank — sequences are broadcast).
+            seq_cpu = sequences.cpu()
+            responses = []
+            for i in range(seq_cpu.shape[0]):
+                plen = int(prompt_lengths[i]) if i < len(prompt_lengths) else 0
+                responses.append(self._tokenizer.decode(seq_cpu[i, plen:], skip_special_tokens=True))
+            rewards_t, details = compute_math_reward(responses, ground_truths)
 
-            # Collect results
-            if rewards.dim() > 1:
-                scores = rewards.squeeze(-1).tolist()
-            else:
-                scores = rewards.tolist()
-            all_scores.extend(scores)
+            all_scores.extend(rewards_t.tolist())
+            all_acc.extend([1.0 if d["acc"] else 0.0 for d in details])
             all_responses.extend(responses)
-
-            # Response lengths
             response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
-            lengths = response_mask.sum(dim=-1).tolist()
-            all_response_lengths.extend([int(x) for x in lengths])
+            all_response_lengths.extend([int(x) for x in response_mask.sum(dim=-1).tolist()])
+
+        # Non-persistent path frees the eval vLLM (kill subprocess: reliable GPU
+        # release on ROCm). Persistent path keeps the resident engine(s) alive.
+        if self._use_vllm and not self._vllm_persistent and self._atom_engine is not None:
+            if self._vllm_dp or self._rank == 0:
+                try:
+                    self._atom_engine.sleep()
+                except Exception:
+                    pass
+        if self._is_distributed:
+            torch.distributed.barrier()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if not all_scores:
             return {}
 
         scores_t = torch.tensor(all_scores, dtype=torch.float32)
+        acc_t = torch.tensor(all_acc, dtype=torch.float32)
         lengths_t = torch.tensor(all_response_lengths, dtype=torch.float32)
 
         metrics: dict[str, float] = {
+            "val-core/acc/mean@1": float(acc_t.mean()),
             "val/score_mean": float(scores_t.mean()),
-            "val/score_max": float(scores_t.max()),
-            "val/score_min": float(scores_t.min()),
-            "val/score_std": float(scores_t.std()) if len(all_scores) > 1 else 0.0,
             "val/response_length_mean": float(lengths_t.mean()),
             "val/num_samples": float(len(all_scores)),
         }
-
-        # Print sample responses (rank 0 only)
         if self._rank == 0:
-            num_print = min(getattr(self.config.logger, 'num_val_samples_to_print', 5), len(all_responses))
+            logger.info(
+                "[eval] step=%d acc=%.4f score_mean=%.4f resp_len=%.1f n=%d",
+                self.global_step + 1, metrics["val-core/acc/mean@1"], metrics["val/score_mean"],
+                metrics["val/response_length_mean"], len(all_scores),
+            )
+            num_print = min(getattr(self.config.logger, "num_val_samples_to_print", 3), len(all_responses))
             for i in range(num_print):
-                logger.info(
-                    "Val sample %d: score=%.3f len=%d response=%s",
-                    i, all_scores[i], all_response_lengths[i],
-                    all_responses[i][:200],
-                )
+                logger.info("[eval] sample %d acc=%.0f resp=...%s", i, all_acc[i], repr(all_responses[i][-160:]))
 
         return metrics
 
