@@ -73,6 +73,7 @@ def asymmetric_clip_loss(
     clip_ratio_c: float = 0.0,
     batch_num_tokens: Optional[int] = None,
     dp_size: int = 1,
+    rollout_is_weights: Optional[Tensor] = None,
 ) -> Tensor:
     """Policy-gradient surrogate with asymmetric ratio clipping (DAPO-style).
 
@@ -95,6 +96,11 @@ def asymmetric_clip_loss(
         batch_num_tokens: Global token count across all GPUs. When provided,
             uses Verl-aligned normalization: ``pg.sum() / batch_num_tokens * dp_size``.
         dp_size: Data-parallel world size (for FSDP all-reduce compensation).
+        rollout_is_weights: Optional per-token truncated importance-sampling
+            weights (TIS/MIS) ``exp(old_logp - rollout_logp)`` between the
+            training policy and the rollout (e.g. FP8 / vLLM) policy. When
+            provided, the per-token PG loss is multiplied by these weights
+            *before* aggregation (verl ``pg_losses * rollout_is_weights``).
 
     Returns:
         Scalar loss tensor to minimize.
@@ -111,6 +117,9 @@ def asymmetric_clip_loss(
         pg_losses3 = -advantages * clip_ratio_c
         pg_clipped = torch.minimum(pg_losses3, pg)
         pg = torch.where(advantages < 0, pg_clipped, pg)
+
+    if rollout_is_weights is not None:
+        pg = pg * rollout_is_weights.to(dtype=pg.dtype)
 
     if mask is not None:
         w = mask.to(dtype=pg.dtype)
