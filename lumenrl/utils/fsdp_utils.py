@@ -71,15 +71,27 @@ def offload_fsdp_optimizer(optimizer: torch.optim.Optimizer) -> None:
 # Original: verl/utils/fsdp_utils.py::load_fsdp_optimizer
 @torch.no_grad()
 def load_fsdp_optimizer(optimizer: torch.optim.Optimizer, device: Any) -> None:
-    """Move all optimizer state tensors to *device* (e.g. ``"cuda"`` or a device id)."""
+    """Move all optimizer state tensors back onto the compute device.
+
+    Moves each parameter's state to that parameter's own device rather than a
+    generic ``"cuda"`` string. This is important for FSDP2: params are DTensors
+    living on ``cuda:{local_rank}`` and the Adam state must land on the exact
+    same device, otherwise ``optimizer.step()`` raises a cuda-vs-cpu (or
+    cuda:i-vs-cuda:j) device mismatch. Using the param device also makes
+    CPU<->GPU offload reload symmetric and robust.
+    """
     if not optimizer.state:
         return
+    want_gpu = (isinstance(device, str) and device in ("cuda", "gpu")) or isinstance(device, int) or isinstance(device, torch.device)
     for param_group in optimizer.param_groups:
         for param in param_group["params"]:
-            state = optimizer.state[param]
+            state = optimizer.state.get(param)
+            if not state:
+                continue
+            target = param.device if want_gpu else torch.device("cpu")
             for key, value in state.items():
-                if isinstance(value, torch.Tensor):
-                    state[key] = value.to(device, non_blocking=True)
+                if isinstance(value, torch.Tensor) and value.device != target:
+                    state[key] = value.to(target, non_blocking=True)
 
 
 # Adapted from verl (https://github.com/verl-project/verl)

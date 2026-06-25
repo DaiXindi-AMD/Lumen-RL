@@ -169,19 +169,61 @@ class AtomConfig:
 
 
 @dataclass
+class VLLMConfig:
+    """Native vLLM rollout engine configuration (vanilla upstream vLLM).
+
+    Mirrors the runbook's ``actor_rollout_ref.rollout`` vLLM knobs so a DAPO run
+    can use vLLM for inference + Lumen FSDP for training without verl.
+    """
+    tensor_parallel_size: int = 1
+    kv_cache_dtype: str = "auto"
+    max_model_len: Optional[int] = None
+    gpu_memory_utilization: float = 0.6
+    gpu_id: Optional[int] = None
+    dtype: str = "bfloat16"
+    enforce_eager: bool = True
+    enable_chunked_prefill: bool = True
+    max_num_batched_tokens: int = 8192
+    max_num_seqs: int = 64
+    swap_space: int = 4
+    trust_remote_code: bool = True
+    # Rollout quantization: "" / "fp8" / "fp8_per_block" (vLLM `quantization=`)
+    quantization: str = ""
+    # When True, vLLM returns per-token rollout log-probs needed for TIS / MIS
+    # rollout correction (verl: actor_rollout_ref.rollout.calculate_log_probs).
+    calculate_log_probs: bool = False
+    # Keep the vLLM engine resident across steps and update weights in place via
+    # `collective_rpc("reload_weights")` instead of killing + rebuilding the
+    # subprocess each step. Removes the per-step rebuild (~45s) AND the ROCm
+    # rebuild-leak OOM. Memory: one resident engine (gpu_memory_utilization)
+    # coexists with FSDP training.
+    persistent: bool = True
+    # Data-parallel rollout: every rank runs its own vLLM on its local GPU and
+    # generates a shard of the batch (then all-gather), instead of rank-0
+    # generating everything. ~Nx generation throughput on N GPUs.
+    data_parallel_rollout: bool = True
+    # Sampling defaults (overridable per-algorithm in the trainer).
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = -1
+
+
+@dataclass
 class TrainingConfig:
     megatron_cfg: MegatronConfig = field(default_factory=MegatronConfig)
     fsdp_cfg: Optional[dict] = None
-    # Training dtype controls both model param storage and FSDP2 MixedPrecision
-    # param_dtype. The optimizer (AdamW) keeps master weights and momentum/variance
-    # in this dtype. Use "fp32" for full FP32 training, "bf16" for mixed precision.
-    # Reduce dtype is always FP32 for numerical stability.
+    # Compute (forward/backward) dtype used by FSDP2 MixedPrecisionPolicy
+    # param_dtype. The optimizer ALWAYS keeps FP32 master weights + Adam
+    # moments regardless of this value, so small updates (lr ~1e-6) are not
+    # lost to bf16 rounding. Use "bf16" for mixed precision (recommended) or
+    # "fp32" for full FP32. Reduce dtype is always FP32 for stability.
     optimizer_dtype: str = "bf16"
 
 
 @dataclass
 class GenerationConfig:
     atom_cfg: AtomConfig = field(default_factory=AtomConfig)
+    vllm_cfg: VLLMConfig = field(default_factory=VLLMConfig)
 
 
 @dataclass
@@ -194,6 +236,12 @@ class PolicyConfig:
     max_total_sequence_length: int = 4096
     max_response_length: int = 20480
     train_global_batch_size: int = 64
+    # Number of *prompt* sequences sampled per generation round for DAPO dynamic
+    # sampling (verl: data.gen_batch_size). 0 = same as the number of prompts
+    # implied by train_global_batch_size (no over-sampling). When DAPO
+    # filter_groups is enabled this should be a multiple of the train prompt
+    # count (e.g. 3x) so degenerate groups can be filtered out.
+    gen_batch_size: int = 0
     train_micro_batch_size: int = 8
     max_token_len_per_gpu: int = 0
     ppo_mini_batch_size: int = 0
@@ -220,6 +268,35 @@ class GRPOConfig:
 
 
 @dataclass
+class FilterGroupsConfig:
+    """DAPO dynamic-sampling filter (verl recipe/dapo filter_groups).
+
+    When enabled the trainer over-samples prompts (``policy.gen_batch_size``),
+    drops prompt groups whose per-prompt ``metric`` has zero std (all-correct or
+    all-wrong → zero GRPO advantage), and keeps generating up to
+    ``max_num_gen_batches`` rounds until ``train_batch_size`` valid prompt groups
+    are collected.
+    """
+    enable: bool = False
+    metric: str = "acc"  # acc / score / seq_reward / seq_final_reward
+    max_num_gen_batches: int = 0  # <=0 means unlimited rounds
+
+
+@dataclass
+class OverlongBufferConfig:
+    """DAPO soft overlong-buffer reward shaping (verl reward_manager/dapo).
+
+    penalty = min(-(resp_len - (max_resp_len - len)) / len * penalty_factor, 0)
+    so the penalty ramps linearly from 0 to ``-penalty_factor`` across the last
+    ``len`` tokens before ``max_resp_len``.
+    """
+    enable: bool = False
+    len: int = 0
+    penalty_factor: float = 0.0
+    log: bool = False
+
+
+@dataclass
 class DAPOConfig:
     num_generations: int = 8
     kl_coeff: float = 0.0
@@ -231,6 +308,12 @@ class DAPOConfig:
     overlong_reward_shaping: bool = True
     loss_mode: str = "token_level"  # "token_level" (standard DAPO) or "gmpo" (geometric mean PO)
     discount: float = 1.0
+    # verl-faithful dynamic sampling + soft overlong shaping.
+    filter_groups: FilterGroupsConfig = field(default_factory=FilterGroupsConfig)
+    overlong_buffer: OverlongBufferConfig = field(default_factory=OverlongBufferConfig)
+    # Max response length used by the soft overlong buffer (tokens). 0 = use
+    # policy.max_response_length.
+    max_resp_len: int = 0
 
 
 @dataclass
@@ -587,7 +670,11 @@ class ProfilerConfig:
     save_path: str = "outputs/profile"
     steps: Optional[list[int]] = None
     profile_continuous_steps: bool = False
-    tool_config: TorchProfilerToolConfig | RocprofToolConfig = field(default_factory=TorchProfilerToolConfig)
+    # NOTE: typed ``Any`` (not a Union of dataclasses) because OmegaConf's
+    # structured-config schema does not support unions of containers. The
+    # profiler consumers (utils/profiler.py) re-validate via isinstance and fall
+    # back to the appropriate default tool config, so YAML still works.
+    tool_config: Any = field(default_factory=TorchProfilerToolConfig)
 
 
 @dataclass

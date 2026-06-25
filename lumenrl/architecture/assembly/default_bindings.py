@@ -8,19 +8,6 @@ from lumenrl.architecture.registry.component_registries import (
     training_backend_registry,
     worker_role_registry,
 )
-from lumenrl.engine.inference.atom_engine import AtomEngine
-from lumenrl.engine.training.fsdp_backend import FSDP2Backend
-from lumenrl.engine.training.megatron_backend import MegatronBackend
-from lumenrl.trainer.async_trainer import AsyncRLTrainer
-from lumenrl.trainer.opd_trainer import OPDTrainer
-from lumenrl.trainer.rl_trainer import RLTrainer
-from lumenrl.trainer.spec_distill_trainer import SpecDistillTrainer
-from lumenrl.workers.actor_worker import LumenActorWorker
-from lumenrl.workers.critic_worker import CriticWorker
-from lumenrl.workers.ref_worker import RefPolicyWorker
-from lumenrl.workers.reward_worker import RewardWorker
-from lumenrl.workers.rollout_worker import AtomRolloutWorker
-from lumenrl.workers.teacher_worker import TeacherWorker
 
 
 def _ensure(registry, key: str, value) -> None:
@@ -29,7 +16,27 @@ def _ensure(registry, key: str, value) -> None:
 
 
 def register_default_bindings() -> None:
-    """Register built-in components for assembler usage."""
+    """Register built-in components for assembler usage.
+
+    Heavy component imports are deferred into this function: ``rl_trainer``
+    imports ``lumenrl.controller`` which (via ``worker_group_factory``) imports
+    this module, so importing trainers/engines at module top creates a circular
+    import. Importing them lazily here breaks that cycle.
+    """
+    from lumenrl.engine.inference.atom_engine import AtomEngine
+    from lumenrl.engine.training.fsdp_backend import FSDP2Backend
+    from lumenrl.engine.training.megatron_backend import MegatronBackend
+    from lumenrl.trainer.async_trainer import AsyncRLTrainer
+    from lumenrl.trainer.opd_trainer import OPDTrainer
+    from lumenrl.trainer.rl_trainer import RLTrainer
+    from lumenrl.trainer.spec_distill_trainer import SpecDistillTrainer
+    from lumenrl.workers.actor_worker import LumenActorWorker
+    from lumenrl.workers.critic_worker import CriticWorker
+    from lumenrl.workers.ref_worker import RefPolicyWorker
+    from lumenrl.workers.reward_worker import RewardWorker
+    from lumenrl.workers.rollout_worker import AtomRolloutWorker
+    from lumenrl.workers.teacher_worker import TeacherWorker
+
     _ensure(worker_role_registry, "actor.default", LumenActorWorker)
     _ensure(worker_role_registry, "critic.default", CriticWorker)
     _ensure(worker_role_registry, "ref.default", RefPolicyWorker)

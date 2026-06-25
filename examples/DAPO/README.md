@@ -273,6 +273,32 @@ For faster iteration, reduce `train_global_batch_size` (e.g. 512 = 32p×16g give
 |--------|----|------|-----------|-------|----------|--------|
 | `run_1a_bf16_sync.sh` | 1A-Sync | Sync on-policy | BF16 | 1536 (96p×16g) | 20K | tested (MI300X) |
 | `run_1a_bf16_async.sh` | 1A-Async | Async off-policy | BF16 | varies | varies | tested |
+| `run_dapo_vllm_fsdp_bf16.sh` | vLLM-FSDP | Sync + **vanilla vLLM** rollout | BF16 | 512 (32p×16g) | 20K | new (no verl) |
+
+### Native vLLM + Lumen FSDP DAPO (no verl)
+
+`run_dapo_vllm_fsdp_bf16.sh` reproduces the verl `recipe/dapo` recipe entirely
+inside LumenRL's native `RLTrainer`, using **vanilla upstream vLLM** for rollout
+(`policy.generation_backend=vllm`) and **Lumen FSDP2** for training — no verl
+dependency. It adds the verl-faithful pieces the native ATOM path was missing:
+
+- **Dynamic sampling** (`algorithm.dapo.filter_groups`): over-samples
+  `policy.gen_batch_size` prompts per round, drops prompt groups with zero `acc`
+  variance, and regenerates up to `max_num_gen_batches` rounds.
+- **Soft overlong-buffer** reward shaping (`algorithm.dapo.overlong_buffer`).
+- **Token-level TIS** rollout correction
+  (`quantization.rollout_correction.rollout_is=token`), powered by vLLM
+  `calculate_log_probs=true`.
+- clip-higher + dual-clip, `loss_agg_mode=token-mean`, GRPO advantage.
+
+```bash
+# smoke (1 step) then long run
+bash examples/DAPO/run_dapo_vllm_fsdp_bf16.sh --smoke-test
+bash examples/DAPO/run_dapo_vllm_fsdp_bf16.sh
+```
+
+See `configs/dapo_qwen3_8b_vllm_fsdp_bf16.yaml` and the repo-root runbook
+`dapo-lumenrl-native-vllm-fsdp-runbook.md` for full details.
 
 ### Training Results (1A-Sync, Qwen3-8B-Base, 8×MI300X)
 

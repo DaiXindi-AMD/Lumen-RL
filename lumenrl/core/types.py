@@ -16,6 +16,7 @@ class TrainingBackend(str, Enum):
 
 class GenerationBackend(str, Enum):
     ATOM = "atom"
+    VLLM = "vllm"
 
 
 class AlgorithmName(str, Enum):
