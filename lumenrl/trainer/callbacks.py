@@ -47,7 +47,8 @@ class LoggingCallback(Callback):
         if trainer._rank != 0:
             return
         parts = [f"{k}={v:.6g}" for k, v in sorted(metrics.items())]
-        logger.info("step=%d %s", step, " ".join(parts))
+        # Display 1-based step (aligns with verl's 1-indexed global_steps).
+        logger.info("step=%d %s", step + 1, " ".join(parts))
 
 
 class CheckpointCallback(Callback):
@@ -220,14 +221,43 @@ class WandbCallback(Callback):
             allow_val_change=True,
         )
 
+    # Curated "core" training-effect metrics (means only, no max/min) shown in a
+    # dedicated wandb `core/` panel group.
+    _CORE_MAP = {
+        "reward/mean": "core/reward_mean",
+        "reward/accuracy": "core/train_accuracy",
+        "seq/mean_response_len": "core/response_len_mean",
+        "response_length/mean": "core/response_len_mean",
+        "timing/step_s": "core/step_time_s",
+        "timing/gen_s": "core/gen_time_s",
+        "timing/train_s": "core/train_time_s",
+        "rollout_correction/kl": "core/kl",
+        "mismatch_kl": "core/mismatch_kl",
+        "entropy": "core/entropy",
+        "grad_norm": "core/grad_norm",
+        "loss": "core/loss",
+    }
+    _EVAL_KEYS = ("val-core/acc/mean@1", "val/accuracy", "eval/accuracy", "val/acc", "val_accuracy")
+
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
         if not self._enabled or self._wandb is None:
             return
         if trainer._rank != 0:
             return
+        # Full detailed metrics under train/, plus a curated core/ group.
         payload = {f"train/{k}": v for k, v in metrics.items()}
-        payload["train/global_step"] = step
-        self._wandb.log(payload, step=step)
+        for src, dst in self._CORE_MAP.items():
+            if src in metrics and dst not in payload:
+                payload[dst] = metrics[src]
+        for ek in self._EVAL_KEYS:
+            if ek in metrics:
+                payload["core/eval_score"] = metrics[ek]
+                break
+        # 1-based step to align the wandb x-axis with verl (global_steps).
+        wstep = step + 1
+        payload["core/step"] = wstep
+        payload["train/global_step"] = wstep
+        self._wandb.log(payload, step=wstep)
 
     def on_train_end(self, trainer: "RLTrainer") -> None:
         if self._enabled and self._wandb is not None:

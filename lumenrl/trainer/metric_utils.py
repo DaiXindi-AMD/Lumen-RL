@@ -34,10 +34,14 @@ def _response_info(batch: DataProto) -> dict[str, Tensor]:
     if prompt_mask is not None:
         prompt_length = prompt_mask.sum(-1).float()
     else:
+        # prompt_length = (all real tokens) - (response tokens). Robust to left/
+        # right padding and to response_mask being the shifted [B, S-1] mask
+        # (prompt zeroed); avoids the buggy ``attention_mask[:, :-S+1]`` slice
+        # that collapsed prompt_length to ~1.
         attention_mask = t.get("attention_mask")
-        if attention_mask is not None and attention_mask.shape[-1] > response_mask.shape[-1]:
-            prompt_mask = attention_mask[:, :-response_mask.shape[-1]]
-            prompt_length = prompt_mask.sum(-1).float()
+        if attention_mask is not None and attention_mask is not response_mask:
+            total_length = attention_mask.sum(-1).float()
+            prompt_length = (total_length - response_length).clamp(min=0.0)
         else:
             prompt_length = torch.zeros_like(response_length)
     return {"prompt_length": prompt_length, "response_length": response_length}

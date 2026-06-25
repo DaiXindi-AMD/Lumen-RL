@@ -225,6 +225,39 @@ def packed_token_log_probs(
     return torch.cat(lp_parts, dim=0).float()  # (total - B,)
 
 
+@torch.no_grad()
+def packed_token_entropy(
+    logits: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """Per-token predictive entropy for packed (flat) logits, shifted.
+
+    Entropy at each non-last position ``H = logsumexp(z) - sum(softmax(z) * z)``
+    computed in float32 and chunked to bound peak memory. Detached (metric only).
+
+    Returns a flat ``(total_tokens - B,)`` tensor aligned with
+    :func:`packed_token_log_probs` output.
+    """
+    total_tokens = logits.shape[0]
+    device = logits.device
+    not_last = torch.ones(total_tokens, dtype=torch.bool, device=device)
+    not_last[cu_seqlens[1:].long() - 1] = False
+    shifted = logits[not_last]  # (total - B, V)
+
+    parts = []
+    for start in range(0, shifted.shape[0], chunk_size):
+        end = min(start + chunk_size, shifted.shape[0])
+        z = shifted[start:end].float()
+        lse = torch.logsumexp(z, dim=-1)
+        probs = torch.softmax(z, dim=-1)
+        ent = lse - (probs * z).sum(dim=-1)
+        parts.append(ent)
+    if not parts:
+        return torch.zeros(0, dtype=torch.float32, device=device)
+    return torch.cat(parts, dim=0)
+
+
 def unpack_log_probs(
     flat_lp: torch.Tensor,
     cu_seqlens: torch.Tensor,

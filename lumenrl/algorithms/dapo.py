@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from lumenrl.algorithms.base_algorithm import BaseAlgorithm
+from lumenrl.algorithms.dapo_sampling import overlong_buffer_penalty
 from lumenrl.algorithms.loss_functions import asymmetric_clip_loss, gmpo_loss, kl_penalty
 from lumenrl.core.config import LumenRLConfig
 from lumenrl.core.protocol import DataProto
@@ -68,7 +69,21 @@ class DAPOAlgorithm(BaseAlgorithm):
                 f"Batch size {rewards.shape[0]} not divisible by num_generations={g}."
             )
 
-        if cfg.overlong_reward_shaping:
+        ob = getattr(cfg, "overlong_buffer", None)
+        if ob is not None and getattr(ob, "enable", False):
+            # verl-faithful soft overlong-buffer shaping (added to base reward).
+            lengths = batch.meta.get("response_lengths")
+            if lengths is not None:
+                max_resp = int(getattr(cfg, "max_resp_len", 0)) or int(
+                    self._config.policy.max_response_length
+                )
+                penalty = overlong_buffer_penalty(
+                    lengths, max_resp_len=max_resp,
+                    buffer_len=int(ob.len), penalty_factor=float(ob.penalty_factor),
+                ).to(device=rewards.device)
+                if penalty.shape[0] == rewards.shape[0]:
+                    rewards = rewards.to(dtype=torch.float32) + penalty
+        elif cfg.overlong_reward_shaping:
             rewards = _apply_overlong_shaping(
                 rewards,
                 batch,
@@ -89,7 +104,8 @@ class DAPOAlgorithm(BaseAlgorithm):
             row_mask = torch.ones(rewards.shape[0], dtype=torch.bool, device=rewards.device)
 
         mean = grouped.mean(dim=1, keepdim=True)
-        std_safe = grouped.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-8)
+        # verl GRPO uses Bessel-corrected (unbiased) std for group normalization.
+        std_safe = grouped.std(dim=1, unbiased=True, keepdim=True).clamp_min(1e-8)
         adv = (grouped - mean) / std_safe
         adv_flat = adv.reshape(-1)
 
@@ -120,6 +136,9 @@ class DAPOAlgorithm(BaseAlgorithm):
         cfg = self._config.algorithm.dapo
         batch_num_tokens = batch.meta.get("batch_num_tokens")
         dp_size = batch.meta.get("dp_size", 1)
+        # Truncated importance sampling weights (rollout policy vs training
+        # policy), aligned per response token. See verl rollout_correction.
+        rollout_is_weights = batch.tensors.get("rollout_is_weights")
 
         # Expand sequence-level advantages [B] -> [B, T] for token-level loss.
         # Multiply by response_mask so prompt tokens get zero advantage
@@ -147,6 +166,18 @@ class DAPOAlgorithm(BaseAlgorithm):
         clip_c = float(getattr(cfg, "clip_ratio_c", 0.0))
         loss_mode = getattr(cfg, "loss_mode", "token_level")
 
+        # Align rollout IS weights to the response mask shape if present.
+        ris = None
+        if rollout_is_weights is not None:
+            ris = rollout_is_weights
+            if ris.dim() == 1:
+                ris = ris.unsqueeze(-1)
+            if ris.shape != logp.shape:
+                try:
+                    ris = ris.expand_as(logp)
+                except RuntimeError:
+                    ris = None
+
         if loss_mode == "gmpo":
             # GMPO: token-level log-ratio clip → geometric mean ratio → seq-level advantage
             pg = gmpo_loss(logp, old_logp, adv, low, high, mask=sm)
@@ -154,6 +185,7 @@ class DAPOAlgorithm(BaseAlgorithm):
             pg = asymmetric_clip_loss(
                 logp, old_logp, adv, low, high, mask=sm, clip_ratio_c=clip_c,
                 batch_num_tokens=batch_num_tokens, dp_size=dp_size,
+                rollout_is_weights=ris,
             )
         else:
             # Sequence-level: mean logp per row, scalar adv per row

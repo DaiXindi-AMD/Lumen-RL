@@ -154,9 +154,11 @@ def compute_rollout_is_weights(
     Returns:
         ``(is_weights, metrics)`` where ``is_weights`` is [B, T].
     """
-    log_ratio = old_log_probs - rollout_log_probs
-    log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+    # log_ratio = log(pi_train / pi_rollout) = old_log_prob - rollout_log_prob.
+    log_ratio_raw = old_log_probs - rollout_log_probs
+    log_ratio = torch.clamp(log_ratio_raw, min=-20.0, max=20.0)
     mask_f = response_mask.float()
+    denom = mask_f.sum().clamp(min=1)
 
     if rollout_is == "token":
         raw_weights = torch.exp(log_ratio)
@@ -171,12 +173,18 @@ def compute_rollout_is_weights(
         weights = torch.ones_like(response_mask, dtype=torch.float32)
 
     if rollout_is_batch_normalize and weights.numel() > 0:
-        w_mean = (weights * mask_f).sum() / mask_f.sum().clamp(min=1)
+        w_mean = (weights * mask_f).sum() / denom
         weights = weights / w_mean.clamp(min=1e-8)
 
+    # Off-policy diagnostics aligned with verl rollout_corr/* (compute on masked
+    # response tokens). kl = E[rollout - old]; k3_kl = E[exp(lr) - lr - 1].
+    kl = float(((-log_ratio_raw) * mask_f).sum() / denom)
+    k3 = float(((torch.exp(log_ratio) - log_ratio - 1.0) * mask_f).sum() / denom)
     metrics = {
-        "rollout_correction/is_weight_mean": float((weights * mask_f).sum() / mask_f.sum().clamp(min=1)),
+        "rollout_correction/is_weight_mean": float((weights * mask_f).sum() / denom),
         "rollout_correction/is_weight_max": float(weights.max()),
+        "rollout_correction/kl": kl,
+        "rollout_correction/k3_kl": k3,
     }
     return weights * mask_f, metrics
 
