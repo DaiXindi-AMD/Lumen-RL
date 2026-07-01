@@ -101,9 +101,19 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             metrics[f"critic/rewards/{k}"] = v
 
     # --- Advantages ---
+    # verl reports critic/advantages as a token-level masked mean (advantages are
+    # broadcast over response tokens, so longer responses carry more weight). Lumen
+    # stores sample-level [B] advantages, so broadcast to [B, T] over the response
+    # mask before aggregating to match verl's statistic.
     advantages = t.get("advantages")
     if advantages is not None:
-        valid_adv = torch.masked_select(advantages, response_mask_bool) if advantages.dim() > 1 else advantages
+        if advantages.dim() == 1 and advantages.shape[0] == response_mask_bool.shape[0]:
+            adv_tok = advantages.unsqueeze(-1).expand_as(response_mask_bool)
+            valid_adv = torch.masked_select(adv_tok, response_mask_bool)
+        elif advantages.dim() > 1:
+            valid_adv = torch.masked_select(advantages, response_mask_bool)
+        else:
+            valid_adv = advantages
         for k, v in _safe_stats(valid_adv).items():
             metrics[f"critic/advantages/{k}"] = v
 

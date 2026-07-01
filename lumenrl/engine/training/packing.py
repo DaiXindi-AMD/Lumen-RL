@@ -181,6 +181,7 @@ def packed_token_log_probs(
     logits: torch.Tensor,
     packed_ids: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    temperature: float = 1.0,
 ) -> torch.Tensor:
     """Compute per-token log-probs from packed (flat) logits.
 
@@ -190,6 +191,10 @@ def packed_token_log_probs(
         logits: ``(total_tokens, V)`` model output (squeezed from batch dim).
         packed_ids: ``(total_tokens,)`` packed token IDs.
         cu_seqlens: ``(B+1,)`` cumulative sequence lengths.
+        temperature: logits are divided by this before ``log_softmax``, matching
+            verl's ``logits.div_(temperature)`` in ``_forward_micro_batch`` (so the
+            training log-probs reflect the sampling distribution). Must be applied
+            consistently to old/train/ref log-probs or the importance ratio drifts.
 
     Returns:
         Flat ``(total_tokens - B,)`` float32 tensor of shifted log-probs.
@@ -218,7 +223,10 @@ def packed_token_log_probs(
     lp_parts = []
     for start in range(0, shifted_logits.shape[0], chunk_size):
         end = min(start + chunk_size, shifted_logits.shape[0])
-        row_lp = F.log_softmax(shifted_logits[start:end], dim=-1)
+        z = shifted_logits[start:end]
+        if temperature != 1.0:
+            z = z / temperature
+        row_lp = F.log_softmax(z, dim=-1)
         lp_parts.append(
             row_lp.gather(-1, shifted_targets[start:end]).squeeze(-1)
         )
@@ -230,11 +238,22 @@ def packed_token_entropy(
     logits: torch.Tensor,
     cu_seqlens: torch.Tensor,
     chunk_size: int = 1024,
+    temperature: float = 1.0,
+    upcast: bool = True,
 ) -> torch.Tensor:
     """Per-token predictive entropy for packed (flat) logits, shifted.
 
-    Entropy at each non-last position ``H = logsumexp(z) - sum(softmax(z) * z)``
-    computed in float32 and chunked to bound peak memory. Detached (metric only).
+    Entropy at each non-last position ``H = logsumexp(z) - sum(softmax(z) * z)``,
+    chunked to bound peak memory. Detached (metric only).
+
+    Args:
+        temperature: logits are divided by this before the entropy computation,
+            matching verl's ``logits.div_(temperature)`` prior to
+            ``entropy_from_logits`` (so the metric reflects the sampling
+            distribution at the rollout temperature).
+        upcast: if True (default) compute in float32; set False to compute in the
+            logits' native dtype (e.g. bf16) to match verl's ``actor/entropy``,
+            which is computed on the bf16 forward logits without upcasting.
 
     Returns a flat ``(total_tokens - B,)`` tensor aligned with
     :func:`packed_token_log_probs` output.
@@ -248,11 +267,15 @@ def packed_token_entropy(
     parts = []
     for start in range(0, shifted.shape[0], chunk_size):
         end = min(start + chunk_size, shifted.shape[0])
-        z = shifted[start:end].float()
+        z = shifted[start:end]
+        if upcast:
+            z = z.float()
+        if temperature != 1.0:
+            z = z / temperature
         lse = torch.logsumexp(z, dim=-1)
         probs = torch.softmax(z, dim=-1)
         ent = lse - (probs * z).sum(dim=-1)
-        parts.append(ent)
+        parts.append(ent.float())
     if not parts:
         return torch.zeros(0, dtype=torch.float32, device=device)
     return torch.cat(parts, dim=0)

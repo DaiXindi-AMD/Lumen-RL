@@ -192,6 +192,11 @@ class VLLMConfig:
     # When True, vLLM returns per-token rollout log-probs needed for TIS / MIS
     # rollout correction (verl: actor_rollout_ref.rollout.calculate_log_probs).
     calculate_log_probs: bool = False
+    # verl alignment: verl seeds each vLLM engine with ``replica_rank + data.seed``
+    # so rollout sampling is reproducible and matched across ranks. ``None`` keeps
+    # vLLM's internal default. Set by the trainer from the top-level ``config.seed``;
+    # the engine adds the per-rank offset (local_rank) at worker launch.
+    seed: Optional[int] = None
     # Keep the vLLM engine resident across steps and update weights in place via
     # `collective_rpc("reload_weights")` instead of killing + rebuilding the
     # subprocess each step. Removes the per-step rebuild (~45s) AND the ROCm
@@ -202,6 +207,13 @@ class VLLMConfig:
     # generates a shard of the batch (then all-gather), instead of rank-0
     # generating everything. ~Nx generation throughput on N GPUs.
     data_parallel_rollout: bool = True
+    # verl-style ONLINE rollout: drive the engine with vLLM v1 ``AsyncLLM`` and
+    # submit every prompt as its own concurrent ``generate(request_id=...)`` call
+    # (continuous batching), matching verl's async server, instead of the offline
+    # ``LLM.generate(list)`` batch call. Weight updates are applied in place via
+    # ``collective_rpc("reload_weights", weights_path=...)`` + ``reset_prefix_cache``
+    # (no engine rebuild). Overridable with env ``LUMEN_VLLM_ASYNC=0/1``.
+    online: bool = True
     # Sampling defaults (overridable per-algorithm in the trainer).
     temperature: float = 1.0
     top_p: float = 1.0
@@ -507,6 +519,14 @@ class RewardConfig:
     dataset: str = ""
     dataset_split: str = "train"
     model_name: Optional[str] = None
+    # verl alignment: verl's dataloader shuffles the training prompts with a
+    # torch.Generator seeded by ``data.seed`` (RandomSampler). Lumen historically
+    # read prompts sequentially, which fed a *different* prompt set per step and
+    # diverged from verl on step-1 metrics. Enable a verl-equivalent shuffle so
+    # both frameworks consume the same prompt order. ``shuffle_seed=None`` falls
+    # back to the top-level ``config.seed``.
+    shuffle: bool = True
+    shuffle_seed: Optional[int] = None
 
 
 @dataclass

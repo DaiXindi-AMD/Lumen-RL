@@ -29,7 +29,7 @@ policy:
   lr_warmup_steps: 10
   weight_decay: 0.1
   max_grad_norm: 1.0
-  lr_decay_style: cosine
+  lr_decay_style: constant             # 对齐 verl baseline（warmup 后恒定 lr，verl lr_scheduler_type=constant）
   training:
     optimizer_dtype: bf16              # params fp32-master / FSDP mixed-precision bf16
     fsdp_cfg:

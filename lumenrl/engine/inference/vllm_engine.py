@@ -48,6 +48,36 @@ _WEIGHT_SYNC_DIR = os.environ.get(
     "/dev/shm/lumenrl_weight_sync",
 )
 
+
+def _kill_proc_tree(pid: int) -> None:
+    """Kill a process and ALL descendants (AsyncLLM spawns a separate EngineCore
+    process, and that spawns GPU workers; terminating only the direct child leaks
+    the EngineCore and keeps the GPU). verl avoids this via ray; we reap the
+    subtree explicitly with psutil."""
+    try:
+        import psutil
+    except Exception:
+        return
+    try:
+        parent = psutil.Process(pid)
+    except Exception:
+        return
+    procs = []
+    try:
+        procs = parent.children(recursive=True)
+    except Exception:
+        pass
+    procs.append(parent)
+    for p in procs:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    try:
+        psutil.wait_procs(procs, timeout=10)
+    except Exception:
+        pass
+
 # The worker subprocess. It reads JSON commands from ``cmd_fifo`` and writes JSON
 # responses to ``resp_fifo``. Arguments are passed positionally (see Popen call).
 _WORKER_SCRIPT = textwrap.dedent("""\
@@ -94,6 +124,8 @@ def build_llm(model_path):
         kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     if cfg.get("quantization"):
         kwargs["quantization"] = cfg["quantization"]
+    if cfg.get("seed") is not None:
+        kwargs["seed"] = int(cfg["seed"])
     return LLM(**kwargs)
 
 llm = build_llm(cfg["model_path"])
@@ -225,13 +257,14 @@ class VLLMEngine:
     def is_awake(self) -> bool:
         return self._initialized and self._proc is not None and self._proc.poll() is None
 
-    def _worker_cfg(self, model_path: str) -> dict[str, Any]:
+    def _worker_cfg(self, model_path: str, seed: int | None = None) -> dict[str, Any]:
         c = self._config
         gpu_mem = c.gpu_memory_utilization
         env_mem = os.environ.get("VLLM_GPU_MEMORY_UTILIZATION")
         if env_mem is not None:
             gpu_mem = float(env_mem)
         return {
+            "seed": seed,
             "model_path": model_path,
             "gpu_memory_utilization": gpu_mem,
             "enforce_eager": bool(c.enforce_eager),
@@ -253,6 +286,14 @@ class VLLMEngine:
 
         path = model_path or self._weight_dir or self._model_name
         gpu_id = self._config.gpu_id if self._config.gpu_id is not None else int(os.environ.get("LOCAL_RANK", "0"))
+
+        # verl alignment: per-engine seed = base_seed + local_rank (verl uses
+        # ``replica_rank + data.seed``). local_rank gives a distinct per-GPU
+        # offset so the 8 colocated engines don't all sample identically.
+        base_seed = getattr(self._config, "seed", None)
+        worker_seed = None
+        if base_seed is not None:
+            worker_seed = int(base_seed) + int(os.environ.get("LOCAL_RANK", "0"))
 
         fifo_dir = tempfile.mkdtemp(prefix="lumenrl_vllm_fifo_")
         self._cmd_fifo = os.path.join(fifo_dir, "cmd")
@@ -284,14 +325,28 @@ class VLLMEngine:
         if attn_backend:
             env["VLLM_ROCM_ATTN_BACKEND"] = attn_backend
 
-        cfg_json = json.dumps(self._worker_cfg(path))
+        cfg_json = json.dumps(self._worker_cfg(path, seed=worker_seed))
         logger.info(
-            "VLLMEngine: starting vLLM worker for %s (gpu=%s, mem=%.0f%%)",
-            path, gpu_id, self._worker_cfg(path)["gpu_memory_utilization"] * 100,
+            "VLLMEngine: starting vLLM worker for %s (gpu=%s, mem=%.0f%%, seed=%s)",
+            path, gpu_id, self._worker_cfg(path, seed=worker_seed)["gpu_memory_utilization"] * 100,
+            worker_seed,
         )
 
+        # Online (verl-style) AsyncLLM worker vs offline inline LLM worker.
+        # Default to the online AsyncLLM path (config.online); env var overrides.
+        # AsyncLLM spawns a separate EngineCore process (multiprocessing spawn),
+        # which requires a standalone importable module file (not `python -c`).
+        _online_default = "1" if bool(getattr(self._config, "online", True)) else "0"
+        if os.environ.get("LUMEN_VLLM_ASYNC", _online_default) == "1":
+            worker_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vllm_async_worker.py")
+            popen_cmd = [sys.executable, "-u", worker_py, self._cmd_fifo, self._resp_fifo, cfg_json]
+            logger.info("VLLMEngine: launching ONLINE AsyncLLM worker (%s)", worker_py)
+        else:
+            popen_cmd = [sys.executable, "-u", "-c", _WORKER_SCRIPT, self._cmd_fifo, self._resp_fifo, cfg_json]
+            logger.info("VLLMEngine: launching OFFLINE LLM worker (inline)")
+
         self._proc = subprocess.Popen(
-            [sys.executable, "-u", "-c", _WORKER_SCRIPT, self._cmd_fifo, self._resp_fifo, cfg_json],
+            popen_cmd,
             stdin=subprocess.DEVNULL,
             stdout=None,
             stderr=None,
@@ -419,6 +474,7 @@ class VLLMEngine:
         """Kill the vLLM subprocess to free all GPU memory for training."""
         if self._proc is None or self._proc.poll() is not None:
             return
+        _pid = self._proc.pid
         try:
             self._send_cmd({"cmd": "shutdown"})
         except Exception:
@@ -431,6 +487,9 @@ class VLLMEngine:
                 self._proc.kill()
             except Exception:
                 pass
+        # Reap the whole subtree (worker + AsyncLLM EngineCore + GPU workers) so
+        # the online EngineCore never leaks the GPU after sleep.
+        _kill_proc_tree(_pid)
         for f in [self._cmd_f, self._resp_f]:
             try:
                 if f:
@@ -455,6 +514,7 @@ class VLLMEngine:
 
     def shutdown(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
+            _pid = self._proc.pid
             try:
                 self._send_cmd({"cmd": "shutdown"})
             except Exception:
@@ -467,6 +527,7 @@ class VLLMEngine:
                     self._proc.kill()
                 except Exception:
                     pass
+            _kill_proc_tree(_pid)
         for f in [self._cmd_f, self._resp_f]:
             try:
                 if f:
