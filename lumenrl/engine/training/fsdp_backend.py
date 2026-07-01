@@ -121,8 +121,12 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
     lumen_norm = quant_config.get("lumen_norm") or os.environ.get("LUMEN_NORM", "0") == "1"
     fused_mlp = quant_config.get("fused_mlp") or os.environ.get("LUMEN_FUSED_MLP", "0") == "1"
     fused_rope = quant_config.get("fused_rope") or os.environ.get("LUMEN_FUSED_ROPE", "0") == "1"
+    # ATOM rollout op-alignment (verl FP8 recipe: LUMEN_ROLLOUT=ATOM). Patches
+    # norm/sdpa/linear/mlp with AITER kernels so the training-side forward matches
+    # the AITER-based vLLM rollout. Works in pure BF16 (no FP8 quant).
+    lumen_rollout = quant_config.get("rollout") or os.environ.get("LUMEN_ROLLOUT", "")
 
-    if not (fp8_enabled or fp8_pm or lumen_norm or fused_mlp or fused_rope):
+    if not (fp8_enabled or fp8_pm or lumen_norm or fused_mlp or fused_rope or lumen_rollout):
         return model
 
     try:
@@ -136,6 +140,8 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
             hf_attn_patch=True,
             fp8_weight_cache=quant_config.get("fp8_weight_cache", False),
         )
+        if lumen_rollout:
+            kwargs["rollout"] = lumen_rollout
         if fp8_enabled:
             # FP8 mode: enable quantized linear and related features
             kwargs.update(
@@ -146,15 +152,20 @@ def _apply_lumen_fp8(model: nn.Module, quant_config: dict[str, Any]) -> nn.Modul
                 fp8_param_gather=os.environ.get("LUMEN_FP8_PARAM_GATHER", "0") == "1",
             )
         else:
-            # BF16 mode: disable FP8 quantized linear to avoid unsupported GEMM errors
+            # BF16 mode: no FP8 quantized linear (scaling="none"); ATOM/norm/attn
+            # patches still apply with AITER BF16 kernels.
             kwargs.update(
+                scaling="none",
                 quantize_activation=False,
                 fp8_wgrad=False,
             )
         cfg = LumenConfig(**kwargs)
         _manager, model = cfg.enable(model)
-        logger.info("Lumen optimizations applied (fp8=%s, fp8pm=%s, norm=%s, fused_mlp=%s, fused_rope=%s)",
-                     fp8_enabled, fp8_pm, lumen_norm, fused_mlp, fused_rope)
+        logger.info(
+            "Lumen optimizations applied (fp8=%s, fp8pm=%s, norm=%s, fused_mlp=%s, "
+            "fused_rope=%s, rollout=%s)",
+            fp8_enabled, fp8_pm, lumen_norm, fused_mlp, fused_rope, lumen_rollout or "(none)",
+        )
     except ImportError:
         logger.warning("lumen package not installed; skipping Lumen optimizations.")
     except Exception as exc:

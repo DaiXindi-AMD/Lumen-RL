@@ -101,6 +101,7 @@ class RLTrainer:
         # Running prompt cursor for DAPO dynamic sampling (advances across
         # generation rounds, not just steps).
         self._prompt_cursor: int = 0
+        self._prompt_perm: Any = None
         self._is_distributed: bool = torch.distributed.is_initialized()
         self._rank: int = torch.distributed.get_rank() if self._is_distributed else 0
         self._world_size: int = torch.distributed.get_world_size() if self._is_distributed else 1
@@ -177,7 +178,7 @@ class RLTrainer:
             "lr": lr,
             "weight_decay": getattr(self.config.policy, "weight_decay", 0.01),
             "clip_grad": getattr(self.config.policy, "max_grad_norm", 1.0),
-            "lr_scheduler_type": "cosine",
+            "lr_scheduler_type": getattr(self.config.policy, "lr_decay_style", "cosine"),
             "lr_warmup_steps": self._lr_warmup_steps,
             "lr_warmup_steps_ratio": getattr(self.config.policy, "warmup_ratio", 0.0),
             "total_training_steps": int(self.config.num_training_steps),
@@ -239,6 +240,11 @@ class RLTrainer:
         if self._use_vllm:
             from lumenrl.engine.inference.vllm_engine import VLLMEngine
             vllm_cfg = self.config.policy.generation.vllm_cfg
+            # verl alignment: seed the rollout engine with the top-level seed when
+            # the config doesn't override it, so vLLM sampling is reproducible and
+            # matched to verl (which uses replica_rank + data.seed per engine).
+            if getattr(vllm_cfg, "seed", None) is None:
+                vllm_cfg.seed = int(getattr(self.config, "seed", 42))
             self._atom_engine = VLLMEngine(config=vllm_cfg, model_name=model_name)
             logger.info(
                 "[rank %d] vLLM engine configured (lazy init on first rollout, "
@@ -507,6 +513,37 @@ class RLTrainer:
             self._dataset = load_dataset(dataset_path, split="train")
 
         logger.info("Loaded dataset: %d samples from %s", len(self._dataset), dataset_path)
+        self._build_prompt_permutation()
+
+    def _build_prompt_permutation(self) -> None:
+        """Build a verl-equivalent shuffle of the training prompts.
+
+        verl's StatefulDataLoader uses ``RandomSampler`` with a
+        ``torch.Generator`` seeded by ``data.seed``. That sampler yields exactly
+        ``torch.randperm(N, generator=Generator(seed))`` for the first epoch
+        (verified against torchdata). We reproduce that permutation here so Lumen
+        consumes the same prompt order as verl. When disabled, the identity
+        permutation reproduces the previous sequential behavior.
+        """
+        self._prompt_perm = None
+        if self._dataset is None:
+            return
+        reward_cfg = getattr(self.config, "reward", None)
+        do_shuffle = bool(getattr(reward_cfg, "shuffle", True)) if reward_cfg is not None else True
+        if not do_shuffle:
+            logger.info("Prompt shuffle disabled; reading dataset sequentially.")
+            return
+        seed = getattr(reward_cfg, "shuffle_seed", None) if reward_cfg is not None else None
+        if seed is None:
+            seed = int(getattr(self.config, "seed", 42))
+        n = len(self._dataset)
+        gen = torch.Generator()
+        gen.manual_seed(int(seed))
+        self._prompt_perm = torch.randperm(n, generator=gen).tolist()
+        logger.info(
+            "Built verl-equivalent prompt shuffle: N=%d seed=%d first8=%s",
+            n, int(seed), self._prompt_perm[:8],
+        )
 
     def _load_val_dataset(self, path: str) -> None:
         """Load validation dataset."""
@@ -593,6 +630,24 @@ class RLTrainer:
                 except Exception:
                     logger.warning("[rank %d] Optimizer state restore failed; using fresh optimizer.", self._rank)
 
+        # Restore FP32 master weights (bf16 optimizer) and LR scheduler position
+        # if the checkpoint carried them; without this a bf16-optimizer resume
+        # would reinitialise the master copy and drift from the saved model.
+        fp32_params = payload.get("fp32_params")
+        if fp32_params and self._optimizer is not None and hasattr(self._optimizer, "fp32_params"):
+            try:
+                for dst, src in zip(self._optimizer.fp32_params, fp32_params):
+                    dst.data.copy_(src.to(dst.data.device, dtype=dst.data.dtype))
+                logger.info("[rank %d] Restored %d FP32 master params.", self._rank, len(fp32_params))
+            except Exception as exc:
+                logger.warning("[rank %d] FP32 master restore failed (%s).", self._rank, exc)
+        sched_epoch = payload.get("scheduler_last_epoch")
+        if sched_epoch is not None and self._optimizer is not None and hasattr(self._optimizer, "scheduler"):
+            try:
+                self._optimizer.scheduler.last_epoch = int(sched_epoch)
+            except Exception:
+                pass
+
         del payload
         gc.collect()
         logger.info("[rank %d] Resume complete. Will start from step %d.", self._rank, self._resume_step)
@@ -619,6 +674,9 @@ class RLTrainer:
 
         dataset_len = len(self._dataset)
         indices = [(start + i) % dataset_len for i in range(count)]
+        perm = getattr(self, "_prompt_perm", None)
+        if perm is not None:
+            indices = [perm[idx] for idx in indices]
         samples = [self._dataset[idx] for idx in indices]
 
         prompts = []
@@ -883,8 +941,20 @@ class RLTrainer:
         else:
             max_tok = max(128, self.config.policy.max_total_sequence_length // 2)
         sp: dict[str, Any] = {"max_tokens": max_tok}
-        if algo_name == "dapo":
-            sp.update({"temperature": 1.0, "top_p": 0.95})
+        # Read sampling params from config (vllm_cfg) so the training rollout
+        # matches the configured/verl values instead of hardcoded ones. verl
+        # uses temperature=1.0, top_p=1.0, top_k=-1; hardcoding top_p=0.95 here
+        # truncated the nucleus and systematically shortened the response tail
+        # (response_length/max stuck ~2700 vs verl ~8192 on identical seed/data).
+        _vcfg = getattr(self.config.policy.generation, "vllm_cfg", None)
+        if _vcfg is not None:
+            sp.update({
+                "temperature": float(getattr(_vcfg, "temperature", 1.0) or 1.0),
+                "top_p": float(getattr(_vcfg, "top_p", 1.0) or 1.0),
+                "top_k": int(getattr(_vcfg, "top_k", -1)),
+            })
+        elif algo_name == "dapo":
+            sp.update({"temperature": 1.0, "top_p": 1.0})
         elif algo_name == "grpo":
             sp.update({"temperature": 0.7})
         else:
@@ -1587,6 +1657,11 @@ class RLTrainer:
         model.eval()
         S = sequences.shape[1]
 
+        # Same sampling-temperature scaling as _train_step's log_probs, so that
+        # old/ref log-probs and train log-probs share verl's div_(temperature)
+        # convention and the importance ratio is unbiased.
+        _etemp = float(getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0)
+
         # Use _dynamic_mini_batches-style chunking by actual token count
         max_tok = int(self.config.policy.max_token_len_per_gpu)
         seq_lens = attention_mask.sum(dim=1).long()
@@ -1634,6 +1709,7 @@ class RLTrainer:
                     logits = logits.squeeze(0)
                     flat_lp = packed_token_log_probs(
                         logits, packed.input_ids.squeeze(0), packed.cu_seqlens,
+                        temperature=_etemp,
                     )
                     token_lp = unpack_log_probs(
                         flat_lp, packed.cu_seqlens, packed.seq_lens, S,
@@ -1717,6 +1793,194 @@ class RLTrainer:
             # Prompt spans [actual_start, actual_start + plen)
             mask[i, actual_start:actual_start + plen] = 0
         return mask[:, 1:]
+
+    @torch.no_grad()
+    def _packed_entropy_chunked(
+        self, sequences: torch.Tensor, attention_mask: torch.Tensor,
+        temperature: float, S: int,
+    ) -> torch.Tensor:
+        """Per-token entropy [B, S-1] via the same chunked packed forward as
+        :meth:`_compute_log_probs_for_model` (avoids OOM on the full vocab)."""
+        from lumenrl.engine.training.packing import (
+            PackingContext, pack_sequences, packed_token_entropy, unpack_log_probs,
+        )
+        self._actor_model.eval()
+        max_tok = int(self.config.policy.max_token_len_per_gpu)
+        seq_lens = attention_mask.sum(dim=1).long()
+        n = sequences.shape[0]
+        chunks: list[tuple[int, int]] = []
+        start = 0
+        while start < n:
+            tok = 0
+            end = start
+            while end < n:
+                sl = int(seq_lens[end].item())
+                if tok + sl > max_tok and end > start:
+                    break
+                tok += sl
+                end += 1
+            chunks.append((start, end))
+            start = end
+        real = len(chunks)
+        if self._is_distributed and self._world_size > 1:
+            import torch.distributed as dist
+            ct = torch.tensor([real], device=self._device)
+            dist.all_reduce(ct, op=dist.ReduceOp.MAX)
+            while len(chunks) < int(ct.item()):
+                chunks.append(chunks[-1])
+        outs = []
+        for ci, (cs, ce) in enumerate(chunks):
+            packed = pack_sequences(sequences[cs:ce], attention_mask[cs:ce])
+            with PackingContext(packed.cu_seqlens, packed.max_seqlen):
+                o = self._actor_model(
+                    input_ids=packed.input_ids, position_ids=packed.position_ids,
+                    attention_mask=None,
+                )
+                logits = (o.logits if hasattr(o, "logits") else o).squeeze(0)
+                ef = packed_token_entropy(
+                    logits, packed.cu_seqlens, temperature=temperature, upcast=True,
+                )
+                eu = unpack_log_probs(ef, packed.cu_seqlens, packed.seq_lens, S)
+                if ci < real:
+                    outs.append(eu)
+                del o, logits
+        return torch.cat(outs, dim=0)
+
+    @torch.no_grad()
+    def replay_compare(self, dump_path: str) -> None:
+        """Replay verl's dumped rollout sequences through Lumen's training forward.
+
+        Loads an engine-agnostic verl dump (per-sequence token ids + verl's
+        recomputed old_log_probs / rollout_log_probs / per-token advantages /
+        sequence reward / uid), rebuilds the SAME sequences, runs Lumen's packed
+        forward to obtain log_probs + entropy, recomputes the GRPO advantage and
+        the DAPO policy loss, and prints a side-by-side comparison. This isolates
+        forward / advantage / loss consistency from rollout sampling noise.
+        """
+        from collections import OrderedDict
+        from lumenrl.algorithms.loss_functions import asymmetric_clip_loss
+
+        data = torch.load(dump_path, weights_only=False)
+        samples = data["samples"]
+        meta = data["meta"]
+        g = int(meta.get("n", 8))
+
+        # Reorder so each consecutive block of g rows is one GRPO group (by uid).
+        groups: "OrderedDict[str, list]" = OrderedDict()
+        for s in samples:
+            groups.setdefault(s["uid"], []).append(s)
+        samples = [s for lst in groups.values() for s in lst]
+        B = len(samples)
+
+        pad_id = self._tokenizer.pad_token_id or 0
+        seqs = [list(s["prompt_ids"]) + list(s["response_ids"]) for s in samples]
+        S = max(len(x) for x in seqs)
+        input_ids = torch.full((B, S), pad_id, dtype=torch.long)
+        attn = torch.zeros((B, S), dtype=torch.long)
+        for i, seq in enumerate(seqs):
+            L = len(seq)
+            input_ids[i, S - L:] = torch.tensor(seq, dtype=torch.long)
+            attn[i, S - L:] = 1
+        prompt_lengths = [len(s["prompt_ids"]) for s in samples]
+        input_ids = input_ids.to(self._device)
+        attn = attn.to(self._device)
+
+        response_mask = self._build_response_mask(input_ids, attn, prompt_lengths)  # [B,S-1]
+
+        verl_olp = torch.zeros((B, S - 1), dtype=torch.float32, device=self._device)
+        verl_rolp = torch.zeros((B, S - 1), dtype=torch.float32, device=self._device)
+        verl_adv = torch.zeros((B, S - 1), dtype=torch.float32, device=self._device)
+        verl_ris = torch.ones((B, S - 1), dtype=torch.float32, device=self._device)
+        seq_reward = torch.zeros(B, dtype=torch.float32, device=self._device)
+        verl_adv_seq = torch.zeros(B, dtype=torch.float32, device=self._device)
+        has_ris = False
+        for i, s in enumerate(samples):
+            L = len(seqs[i])
+            actual_start = S - L
+            base = actual_start + prompt_lengths[i]  # abs pos of first response token
+            olp = s["old_log_probs"]
+            rolp = s["rollout_log_probs"]
+            advt = s["adv_tokens"]
+            ris = s.get("rollout_is_weights")
+            for m in range(len(olp)):
+                col = base + m - 1
+                if 0 <= col < S - 1:
+                    verl_olp[i, col] = olp[m]
+                    if rolp is not None:
+                        verl_rolp[i, col] = rolp[m]
+                    if advt:
+                        verl_adv[i, col] = advt[m]
+                    if ris is not None:
+                        verl_ris[i, col] = ris[m]
+                        has_ris = True
+            seq_reward[i] = float(s["token_level_reward"])
+            verl_adv_seq[i] = float(advt[0]) if advt else 0.0
+
+        _etemp = float(getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0)
+        # Lumen forward on the EXACT verl sequences (all ranks participate).
+        lumen_olp = self._compute_log_probs_for_model(self._actor_model, input_ids, attn)
+        lumen_ent = self._packed_entropy_chunked(input_ids, attn, _etemp, S)
+
+        if self._rank != 0:
+            return
+
+        rm = response_mask.bool()
+        nz = rm.sum().clamp(min=1).item()
+
+        # (A) forward log-prob consistency
+        olp_diff = (lumen_olp - verl_olp)[rm]
+        lp_mae = olp_diff.abs().mean().item()
+        lp_max = olp_diff.abs().max().item()
+        lumen_olp_mean = lumen_olp[rm].mean().item()
+        verl_olp_mean = verl_olp[rm].mean().item()
+        ratio = torch.exp(olp_diff.clamp(-20, 20))
+        ratio_mean = ratio.mean().item()
+        ratio_std = ratio.std().item()
+
+        # (B) entropy (token-mean over response mask)
+        lumen_entropy = (lumen_ent * rm.float()).sum().item() / nz
+
+        # (C) GRPO advantage: Lumen eps vs verl eps, both vs verl dump
+        R = seq_reward.view(-1, g)
+        mean = R.mean(dim=1, keepdim=True)
+        std_unb = R.std(dim=1, unbiased=True, keepdim=True)
+        adv_lumen = ((R - mean) / std_unb.clamp_min(1e-8)).reshape(-1)
+        adv_verleps = ((R - mean) / (std_unb + 1e-6)).reshape(-1)
+        adv_mae_lumen = (adv_lumen - verl_adv_seq).abs().mean().item()
+        adv_mae_verleps = (adv_verleps - verl_adv_seq).abs().mean().item()
+
+        # (D) DAPO policy loss (token-mean, global token denom)
+        Ntok = int(rm.sum().item())
+        ris_arg = verl_ris if has_ris else None
+        loss_lumenfwd = asymmetric_clip_loss(
+            lumen_olp, verl_olp, verl_adv, meta["clip_ratio_low"], meta["clip_ratio_high"],
+            mask=response_mask, clip_ratio_c=meta["clip_ratio_c"],
+            batch_num_tokens=Ntok, dp_size=1, rollout_is_weights=ris_arg,
+        ).item()
+        loss_ratio1 = asymmetric_clip_loss(
+            verl_olp, verl_olp, verl_adv, meta["clip_ratio_low"], meta["clip_ratio_high"],
+            mask=response_mask, clip_ratio_c=meta["clip_ratio_c"],
+            batch_num_tokens=Ntok, dp_size=1, rollout_is_weights=ris_arg,
+        ).item()
+
+        log = logger.info
+        log("================ REPLAY COMPARE (verl seqs -> Lumen forward) ================")
+        log("samples=%d groups=%d g=%d S=%d resp_tokens=%d temp=%.3f", B, B // g, g, S, Ntok, _etemp)
+        log("[A] log_prob | Lumen mean=%.5f verl mean=%.5f MAE=%.5f max|d|=%.4f",
+            lumen_olp_mean, verl_olp_mean, lp_mae, lp_max)
+        log("[A] ratio exp(lumen-verl): mean=%.5f std=%.5f (==1.0 => forward identical)",
+            ratio_mean, ratio_std)
+        log("[B] entropy  | Lumen=%.5f  (compare to verl actor/entropy in verl log)", lumen_entropy)
+        log("[C] adv MAE vs verl dump: lumen-eps(1e-8)=%.6f  verl-eps(1e-6)=%.6f",
+            adv_mae_lumen, adv_mae_verleps)
+        log("[C] adv lumen[:6]=%s", [round(x, 4) for x in adv_lumen[:6].tolist()])
+        log("[C] adv verl [:6]=%s", [round(x, 4) for x in verl_adv_seq[:6].tolist()])
+        log("[D] pg_loss  | Lumen-fwd=%.6f  ratio==1(adv+TIS+agg)=%.6f  (compare verl actor/pg_loss)",
+            loss_lumenfwd, loss_ratio1)
+        log("[*] rollout_is present=%s mean=%.5f | seq_reward mean=%.4f",
+            has_ris, (verl_ris[rm].mean().item() if has_ris else float("nan")),
+            seq_reward.mean().item())
+        log("============================================================================")
 
     def _update_lr(self, step: int) -> None:
         """Advance LR scheduler via Engine, falling back to manual warmup."""
@@ -1846,21 +2110,45 @@ class RLTrainer:
             logits = outputs.logits if hasattr(outputs, "logits") else outputs
             logits = logits.squeeze(0)  # (total_tokens, V)
 
+            # Sampling temperature: scale logits before BOTH log_prob and entropy,
+            # matching verl's logits.div_(temperature) in _forward_micro_batch. It
+            # must be applied identically to old/train/ref log-probs (see
+            # _compute_log_probs_for_model) so the importance ratio stays correct.
+            _etemp = float(getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0)
+
             flat_lp = packed_token_log_probs(
                 logits, packed.input_ids.squeeze(0), packed.cu_seqlens,
+                temperature=_etemp,
             )
             # Predictive entropy (metric only, detached) over response tokens.
+            # Aligned with verl actor/entropy: logits/temperature, token-mean over
+            # the response mask. verl computes entropy via torch.compile (default
+            # use_torch_compile=True), whose inductor backend accumulates the
+            # softmax / sum(pd*logits) reductions over the ~150k vocab in fp32.
+            # We therefore compute in fp32 (upcast=True): eager bf16 accumulation
+            # over such a large vocab biases the entropy by ~0.03+ vs fp32, which
+            # is the residual we previously saw — it is a reduction-precision
+            # (not operator) difference.
             _entropy_mean = None
+            _entropy_sum = None   # token-weighted sum (for verl-aligned GLOBAL token-mean)
+            _entropy_tok = None   # response token count (excludes dummy/padding mini-batches)
             try:
-                _ent_flat = packed_token_entropy(logits.detach(), packed.cu_seqlens)
+                _ent_flat = packed_token_entropy(
+                    logits.detach(), packed.cu_seqlens,
+                    temperature=_etemp, upcast=True,
+                )
                 _ent_unpacked = unpack_log_probs(
                     _ent_flat, packed.cu_seqlens, packed.seq_lens, sequences.shape[1],
                 )
                 if _resp is not None:
                     _rm_e = _resp.to(dtype=_ent_unpacked.dtype)
-                    _entropy_mean = float((_ent_unpacked * _rm_e).sum() / _rm_e.sum().clamp(min=1.0))
+                    _entropy_sum = float((_ent_unpacked * _rm_e).sum())
+                    _entropy_tok = float(_rm_e.sum())
+                    _entropy_mean = _entropy_sum / max(_entropy_tok, 1.0)
                 else:
-                    _entropy_mean = float(_ent_unpacked.mean())
+                    _entropy_sum = float(_ent_unpacked.sum())
+                    _entropy_tok = float(_ent_unpacked.numel())
+                    _entropy_mean = _entropy_sum / max(_entropy_tok, 1.0)
             except Exception:
                 _entropy_mean = None
             del outputs, logits
@@ -1907,6 +2195,12 @@ class RLTrainer:
         metrics["mismatch_kl"] = _mismatch_kl
         if _entropy_mean is not None:
             metrics["entropy"] = _entropy_mean
+            # verl-aligned GLOBAL token-mean: report per-mb sum + token count so
+            # the trainer can aggregate sum/tok across mini-batches and ranks
+            # (NOT a simple average of per-mb means, which is biased by uneven
+            # mini-batch token counts and by FSDP dummy/padding mini-batches).
+            metrics["entropy_sum"] = _entropy_sum
+            metrics["entropy_tok"] = _entropy_tok
         return metrics
 
     def train(self) -> None:
@@ -1933,6 +2227,15 @@ class RLTrainer:
         _train_prompts = max(1, self.config.policy.train_global_batch_size // max(1, num_generations))
         _gp = int(self.config.policy.gen_batch_size) if self.config.policy.gen_batch_size > 0 else _train_prompts
         self._prompt_cursor = start_step * _gp
+
+        # On resume, push the restored actor weights to the rollout engine BEFORE
+        # the first rollout. Otherwise the engine would start from the base model
+        # (its lazy wake loads model_name), making the first resumed step wildly
+        # off-policy (mismatch_kl huge, is_weight≈0). Sets the engine's weight dir
+        # so its first wake loads the resumed weights.
+        if start_step > 0 and self._use_atom and self._atom_engine is not None:
+            logger.info("[rank %d] Resume: syncing restored weights to rollout engine before first rollout.", self._rank)
+            self._sync_weights_to_atom()
 
         for step in range(start_step, total_steps):
             step_start = time.time()
@@ -2072,6 +2375,39 @@ class RLTrainer:
 
             batch = self._algorithm.compute_advantages(batch)
             batch = apply_rollout_correction(batch, self.config)
+
+            # --- Same-group dump (env-gated, first step only) ---
+            # On the SAME sequences, capture: rollout_log_probs (sampling H(q)),
+            # old_log_probs (cross-entropy q->p on sampled tokens), per-token entropy
+            # (training policy H(p)). Lets us check E[-rollout_logp] vs E[-old_logp]
+            # vs mean(entropy) on identical tokens (verl baseline: all ≈ equal).
+            if step == start_step and os.environ.get("LUMEN_DUMP_ROLLOUT"):
+                _etemp = float(getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0)
+                _seqd = batch.tensors["input_ids"]
+                _amd = batch.tensors["attention_mask"]
+                # all ranks run the forward (FSDP collective)
+                _entd = self._packed_entropy_chunked(_seqd, _amd, _etemp, _seqd.shape[1])
+                try:
+                    _rmd = batch.tensors["response_mask"].float()
+                    _perseq = (_entd * _rmd).sum(dim=1) / _rmd.sum(dim=1).clamp(min=1.0)  # [n]
+                    _rlp = batch.tensors.get("rollout_log_probs")
+                    _perseq_rlp = None
+                    if _rlp is not None:
+                        _perseq_rlp = (_rlp * _rmd).sum(dim=1) / _rmd.sum(dim=1).clamp(min=1.0)
+                    _dp = os.environ["LUMEN_DUMP_ROLLOUT"]
+                    _base = _dp.rsplit(".", 1)[0]
+                    torch.save({
+                        "rank": self._rank,
+                        "perseq_entropy": _perseq.detach().float().cpu(),
+                        "perseq_rollout_logp": (_perseq_rlp.detach().float().cpu() if _perseq_rlp is not None else None),
+                        "resp_len": _rmd.sum(dim=1).detach().cpu(),
+                        "sequences": _seqd.detach().cpu(),
+                        "attention_mask": _amd.detach().cpu(),
+                        "prompt_lengths": torch.tensor(prompt_lengths, dtype=torch.long) if isinstance(prompt_lengths, list) else prompt_lengths,
+                    }, f"{_base}_rank{self._rank}.pt")
+                    logger.info("[LUMEN_DUMP] rank %d saved per-seq entropy dump", self._rank)
+                except Exception as _e:
+                    logger.warning("[LUMEN_DUMP] failed: %s", _e)
 
             # --- Extended rollout correction: IS weights + rejection sampling ---
             # (verl/trainer/ppo/ray_trainer.py L1481-1567)
@@ -2283,6 +2619,19 @@ class RLTrainer:
 
             denom = max(1, step_count)
             metrics = {k: v / denom for k, v in metrics_accum.items()}
+            # verl-aligned GLOBAL token-mean entropy: aggregate the raw token-weighted
+            # sum / token count across mini-batches (sum/tok), NOT a simple average of
+            # per-mini-batch means. The simple average is biased because mini-batches
+            # have uneven token counts AND FSDP dummy/padding mini-batches contribute
+            # entropy=0 (tok=0), which previously dragged the reported entropy well
+            # below the true token-mean (e.g. 0.37 vs the true 0.52). Cross-rank
+            # token-weighting is handled in the all_reduce block below.
+            _ent_sum_local = float(metrics_accum.get("entropy_sum", 0.0))
+            _ent_tok_local = float(metrics_accum.get("entropy_tok", 0.0))
+            metrics.pop("entropy_sum", None)
+            metrics.pop("entropy_tok", None)
+            if _ent_tok_local > 0:
+                metrics["entropy"] = _ent_sum_local / _ent_tok_local
             # Mean grad norm over optimizer steps (verl reports the mean across
             # mini-batches, not the max).
             metrics["grad_norm"] = float(grad_norm / max(1, optimizer_steps))
@@ -2322,9 +2671,31 @@ class RLTrainer:
             )
 
             if self._is_distributed:
+                # Cross-rank reduction must respect the metric's semantics:
+                # ``*/max`` is a maximum (use MAX), ``*/min`` is a minimum (use MIN),
+                # everything else is a mean (AVG). Previously AVG was applied to all,
+                # which turned ``response_length/max`` etc. into the *mean of per-rank
+                # maxes* (a fractional value far below the true global max) and made
+                # length/entropy max comparisons against verl misleading.
+                # entropy: token-weighted GLOBAL token-mean across ranks (verl-aligned).
+                # all_reduce SUM of (sum, tok) then divide — NOT AVG of per-rank means,
+                # which is biased when ranks have different response-token counts.
+                _et = torch.tensor([_ent_sum_local, _ent_tok_local],
+                                   dtype=torch.float64, device=self._device)
+                torch.distributed.all_reduce(_et, op=torch.distributed.ReduceOp.SUM)
+                if float(_et[1].item()) > 0:
+                    metrics["entropy"] = float(_et[0].item() / _et[1].item())
                 for k in list(metrics.keys()):
+                    if k == "entropy":
+                        continue  # already reduced (token-weighted) above
+                    if k.endswith("/max"):
+                        op = torch.distributed.ReduceOp.MAX
+                    elif k.endswith("/min"):
+                        op = torch.distributed.ReduceOp.MIN
+                    else:
+                        op = torch.distributed.ReduceOp.AVG
                     t = torch.tensor(metrics[k], dtype=torch.float64, device=self._device)
-                    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.AVG)
+                    torch.distributed.all_reduce(t, op=op)
                     metrics[k] = float(t.item())
 
             # Validation

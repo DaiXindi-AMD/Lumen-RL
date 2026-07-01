@@ -48,8 +48,11 @@ def get_cosine_schedule_with_warmup(
     intercept = (1 + min_lr_ratio) * 0.5
 
     def lr_lambda(current_step: int) -> float:
+        # +1 so the first optimizer step uses base_lr * 1/num_warmup (e.g. 1e-7),
+        # matching verl's warmup (step1=1e-7 ... step10=1e-6) instead of starting
+        # at 0. Compensates for Lumen calling scheduler.step() AFTER optimizer.step().
         if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
+            return float(current_step + 1) / float(max(1, num_warmup_steps))
         progress = float(current_step - num_warmup_steps) / float(
             max(1, num_training_steps - num_warmup_steps)
         )
@@ -69,8 +72,11 @@ def get_constant_schedule_with_warmup(
     """Constant LR schedule with a linear warmup phase."""
 
     def lr_lambda(current_step: int) -> float:
+        # +1 so the first optimizer step uses base_lr * 1/num_warmup (e.g. 1e-7),
+        # matching verl's warmup (step1=1e-7 ... step10=1e-6) instead of starting
+        # at 0. Compensates for Lumen calling scheduler.step() AFTER optimizer.step().
         if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1.0, num_warmup_steps))
+            return float(current_step + 1) / float(max(1.0, num_warmup_steps))
         return 1.0
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)

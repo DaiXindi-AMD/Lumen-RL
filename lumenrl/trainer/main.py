@@ -126,6 +126,10 @@ def main() -> None:
 
     try:
         trainer.setup()
+        _replay = os.environ.get("LUMEN_REPLAY_DUMP")
+        if _replay:
+            trainer.replay_compare(_replay)
+            return
         trainer.train()
     except KeyboardInterrupt:
         logger.info("Training interrupted by user.")

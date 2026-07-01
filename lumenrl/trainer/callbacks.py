@@ -87,15 +87,35 @@ class CheckpointCallback(Callback):
         }
 
         model = getattr(trainer, "_actor_model", None) or getattr(trainer, "_draft_model", None)
-
-        if model is not None:
-            state["model_state_dict"] = {
-                k: v.cpu() for k, v in model.state_dict().items()
-            }
-
         opt = trainer._optimizer
+
+        # FSDP2 (fully_shard) parameters are sharded DTensors: a plain
+        # ``model.state_dict()`` returns only THIS rank's 1/N shard, so saving it
+        # from rank 0 alone persists just 1/N of every weight and the checkpoint
+        # is unrecoverable. Use the FSDP2-aware ``get_model_state_dict`` with
+        # ``full_state_dict=True`` (a collective all-gather that MUST run on every
+        # rank) so the file holds the complete, unsharded weights.
+        if model is not None:
+            if getattr(trainer, "_is_distributed", False):
+                from torch.distributed.checkpoint.state_dict import (
+                    StateDictOptions,
+                    get_model_state_dict,
+                    get_optimizer_state_dict,
+                )
+                sd_opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                state["model_state_dict"] = get_model_state_dict(model, options=sd_opts)
+                if opt is not None:
+                    state["optimizer_state_dict"] = get_optimizer_state_dict(
+                        model, opt, options=sd_opts,
+                    )
+            else:
+                state["model_state_dict"] = {
+                    k: v.cpu() for k, v in model.state_dict().items()
+                }
+                if opt is not None:
+                    state["optimizer_state_dict"] = opt.state_dict()
+
         if opt is not None:
-            state["optimizer_state_dict"] = opt.state_dict()
             if hasattr(opt, "fp32_params"):
                 state["fp32_params"] = [p.data.cpu().clone() for p in opt.fp32_params]
             if hasattr(opt, "scheduler"):
