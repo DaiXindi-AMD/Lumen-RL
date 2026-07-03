@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# GPT-OSS-120B Eagle3 SDDD — Docker Launch (vLLM 0.11 + Mooncake TCP, MI350)
+# GPT-OSS-120B Eagle3 SDDD — Docker Launch (ATOM + Mooncake TCP, MI355)
 #
 # Step 0: Prepare combined dataset (UltraChat + Magpie → single JSONL)
 # Step 1: Launch single-pass Eagle3 training in Docker
 #
-# GPU split (8x MI350):
+# GPU split (8x MI355):
 #   GPUs 0-3: FSDP2 draft model training (BF16, LumenRL + aiter)
-#   GPUs 4-7: vLLM teacher inference (TP=4, native MXFP4 gpt-oss-120b)
+#   GPUs 4-7: ATOM teacher inference (TP=4, native MXFP4 gpt-oss-120b)
 # ═══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
@@ -18,8 +18,8 @@ for arg in "$@"; do
     esac
 done
 
-DOCKER_IMAGE="${DOCKER_IMAGE:-lumenrl-vllm-mi350:latest}"
-CONTAINER_NAME="gpt_oss_120b_eagle3_mi350"
+DOCKER_IMAGE="${DOCKER_IMAGE:-gpt_oss_eagle3_train:latest}"
+CONTAINER_NAME="gpt_oss_120b_eagle3_mi355"
 LUMENRL_DIR="${LUMENRL_DIR:-/home/danyzhan/Lumen-RL}"
 
 # Step 0: Prepare combined dataset (skip for smoke test)
@@ -35,10 +35,10 @@ if [ "${SMOKE_TEST}" = false ] && [ ! -f "${DATASET_DIR}/train.jsonl" ]; then
         -e HF_TOKEN="${HF_TOKEN:-}" \
         -e PYTHONUNBUFFERED=1 \
         -v /dev/shm:/dev/shm \
-        -v "${LUMENRL_DIR}/examples:/root/lumenrl/examples" \
+        -v "${LUMENRL_DIR}:/root/lumenrl" \
         -w /root/lumenrl \
         "${DOCKER_IMAGE}" \
-        python3 examples/GPT_OSS_120b_MI355_ATOM/make_dataset.py \
+        python3 -m lumenrl.data.make_dataset \
             --output-dir "${DATASET_DIR}" --skip-existing
     if [ $? -ne 0 ]; then
         echo ">>> Dataset preparation failed." >&2
@@ -51,18 +51,18 @@ fi
 if [ "${SMOKE_TEST}" = true ]; then
     RUN_CMD="bash examples/GPT_OSS_120b_MI355_ATOM/run_gpt_oss_120b.sh --smoke-test"
     echo "═══════════════════════════════════════════════════════════════"
-    echo "  GPT-OSS-120B Eagle3 Smoke Test (Docker) — vLLM, MI350"
+    echo "  GPT-OSS-120B Eagle3 Smoke Test (Docker) — ATOM, MI355"
     echo "  Image:    ${DOCKER_IMAGE}"
-    echo "  GPUs:     8x MI350 (0-3 training, 4-7 inference)"
+    echo "  GPUs:     8x MI355 (0-3 training, 4-7 inference)"
     echo "  Transfer: Mooncake TCP"
     echo "═══════════════════════════════════════════════════════════════"
 else
     RUN_CMD="bash examples/GPT_OSS_120b_MI355_ATOM/run_gpt_oss_120b.sh"
     echo "═══════════════════════════════════════════════════════════════"
-    echo "  GPT-OSS-120B Eagle3 Training (Docker) — vLLM, MI350"
+    echo "  GPT-OSS-120B Eagle3 Training (Docker) — ATOM, MI355"
     echo "  Image:    ${DOCKER_IMAGE}"
     echo "  Dataset:  Combined UltraChat + Magpie (~503K samples)"
-    echo "  GPUs:     8x MI350 (0-3 training, 4-7 inference)"
+    echo "  GPUs:     8x MI355 (0-3 training, 4-7 inference)"
     echo "═══════════════════════════════════════════════════════════════"
 fi
 
@@ -78,7 +78,6 @@ docker run --rm \
     --device /dev/kfd \
     --device /dev/dri \
     --group-add video \
-    --group-add render \
     --cap-add SYS_PTRACE \
     --security-opt seccomp=unconfined \
     -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
@@ -110,17 +109,16 @@ docker run --rm \
     -v "${LUMENRL_DIR}/examples:/root/lumenrl/examples" \
     -v "${LUMENRL_DIR}/output:/root/lumenrl/output" \
     -v "${LUMENRL_DIR}/third_party/Lumen/lumen:/root/Lumen/lumen" \
-    -v "${LUMENRL_DIR}/third_party/ATOM/atom:/root/ATOM/atom" \
-    -v "${LUMENRL_DIR}/third_party/triton_kernels:/root/triton_kernels" \
+    -v "${LUMENRL_DIR}/third_party/ATOM/atom:/app/ATOM/atom" \
     -w /root/lumenrl \
     "${DOCKER_IMAGE}" \
-    bash -c "pip install -e /root/triton_kernels 2>/dev/null; ${RUN_CMD}"
+    bash -c "${RUN_CMD}"
 
 EXIT_CODE=$?
 if [ ${EXIT_CODE} -eq 0 ]; then
-    echo ">>> Docker run (vLLM, MI350) completed successfully."
+    echo ">>> Docker run (ATOM, MI355) completed successfully."
     echo ">>> Logs: ${LUMENRL_DIR}/output/GPT_OSS_120b_SDDD/LumenRL/"
 else
-    echo ">>> Docker run (vLLM, MI350) failed with exit code ${EXIT_CODE}." >&2
+    echo ">>> Docker run (ATOM, MI355) failed with exit code ${EXIT_CODE}." >&2
 fi
 exit ${EXIT_CODE}

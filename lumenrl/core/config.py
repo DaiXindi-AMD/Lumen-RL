@@ -130,8 +130,11 @@ class SpecDistillConfig:
     loss_decay_gamma: float = 7.0
     num_target_layers: int = 1
     aux_hidden_state_layer_ids: Optional[list[int]] = None
+    capture_mode: str = "postnorm"
     anchor_num: int = 512
     spec_length: int = 5
+    shift_input_embeds: bool = False
+    separate_last_hidden: bool = False
 
 
 @dataclass
@@ -152,6 +155,10 @@ class TeacherConfig:
     mori_io_port: int = 0                   # 0 = auto-assign
     mori_io_qp_per_transfer: int = 2        # RDMA queue pairs per transfer
     atom_plugin: bool = False               # Use ATOM as SGLang model plugin
+    # Online distillation: "prefill" (default) or "generate"
+    generate_mode: str = "prefill"
+    generate_max_tokens: int = 2048
+    generate_temperature: float = 0.0
 
 
 @dataclass

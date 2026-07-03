@@ -1,0 +1,76 @@
+FROM rocm/atom:latest
+
+# ---- System dependencies for mooncake source build ----
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git libjsoncpp-dev libgoogle-glog-dev \
+        build-essential wget golang-go pybind11-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---- Training dependencies (not in inference-only image) ----
+# All --no-deps to avoid pulling PyPI torch (which would replace ROCm torch)
+RUN pip install --no-cache-dir --no-deps \
+    "ray[default]>=2.9" \
+    "omegaconf>=2.3" \
+    "accelerate>=0.28" \
+    wandb && \
+    pip install --no-cache-dir --no-deps \
+    "antlr4-python3-runtime==4.9.3" smart_open colorful opencensus opencensus-context \
+    setproctitle platformdirs virtualenv distlib msgpack grpcio \
+    google-api-core google-auth googleapis-common-protos proto-plus \
+    opentelemetry-api opentelemetry-sdk opentelemetry-proto \
+    opentelemetry-semantic-conventions opentelemetry-exporter-prometheus \
+    prometheus_client sentry-sdk gitpython gitdb smmap py-spy jsonschema \
+    jsonschema-specifications referencing rpds-py pyasn1 pyasn1-modules \
+    cryptography cffi pycparser docker wrapt python-discovery
+
+# ---- Mooncake: pip scaffolding + source-build HIP backend ----
+RUN pip install --no-cache-dir "mooncake-transfer-engine==0.3.10.post1" 2>/dev/null || \
+    pip install --no-cache-dir "mooncake-transfer-engine-non-cuda>=0.3.10.post1"
+
+ARG MOONCAKE_COMMIT=f2853a80a494b999d2115449dfd153dd25f5b42d
+RUN git clone https://github.com/kvcache-ai/Mooncake.git /tmp/mooncake && \
+    cd /tmp/mooncake && \
+    git checkout ${MOONCAKE_COMMIT} && \
+    git submodule update --init --recursive && \
+    bash dependencies.sh -y && \
+    pip install pybind11 && \
+    export PATH="/usr/local/go/bin:$PATH" && \
+    mkdir build && cd build && \
+    cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON && \
+    make -j$(nproc) && \
+    make install && \
+    SITE=$(python3 -c "import mooncake; import os; print(os.path.dirname(mooncake.__file__))") && \
+    SRC_STORE=$(find /tmp/mooncake/build -name 'store*.so' -path '*/mooncake-integration/*' | head -1) && \
+    SRC_ENGINE=$(find /tmp/mooncake/build -name 'engine*.so' -path '*/mooncake-integration/*' | head -1) && \
+    if [ -n "$SRC_STORE" ]; then rm -f "$SITE"/store*.so && cp -v "$SRC_STORE" "$SITE/store.so"; fi && \
+    if [ -n "$SRC_ENGINE" ]; then rm -f "$SITE"/engine*.so && cp -v "$SRC_ENGINE" "$SITE/engine.so"; fi && \
+    SRC_MASTER=$(find /tmp/mooncake/build -name 'mooncake_master' -type f -executable | head -1) && \
+    if [ -n "$SRC_MASTER" ]; then cp -v "$SRC_MASTER" "$SITE/mooncake_master"; fi && \
+    ln -sf "$SITE/mooncake_master" /usr/local/bin/mooncake_master && \
+    rm -rf /tmp/mooncake
+
+# ---- Apply ATOM gpt_oss.py patch ----
+COPY examples/GPT_OSS_120b_MI355_ATOM/patches/atom_gpt_oss.patch /tmp/patches/
+RUN cd /app/ATOM && git apply /tmp/patches/atom_gpt_oss.patch && rm -rf /tmp/patches
+
+# ---- ATOM extensions (not in rocm/atom:latest base image) ----
+COPY third_party/ATOM/atom/rollout/ /app/ATOM/atom/rollout/
+COPY third_party/ATOM/atom/transfer/ /app/ATOM/atom/transfer/
+
+# ---- LumenRL ----
+COPY setup.py pyproject.toml README.md /root/lumenrl/
+COPY lumenrl/ /root/lumenrl/lumenrl/
+RUN pip install --no-deps -e /root/lumenrl
+
+# ---- Lumen (training engine with HIP C++ extensions) ----
+COPY third_party/Lumen/ /root/Lumen/
+RUN pip install --no-deps -e /root/Lumen 2>/dev/null || \
+    pip install --no-deps --no-build-isolation -e /root/Lumen
+
+# ---- Example configs and scripts ----
+COPY examples/GPT_OSS_120b_MI355_ATOM/ /root/lumenrl/examples/GPT_OSS_120b_MI355_ATOM/
+
+RUN rm -rf /root/.cache/atom/*
+
+WORKDIR /root/lumenrl

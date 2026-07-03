@@ -70,7 +70,7 @@ def _tokenize_single(messages):
     last_turn_only = _resolve_last_turn_loss_only(messages)
     input_ids, loss_mask = parser.parse(messages, max_length, last_turn_only=last_turn_only)
 
-    if loss_mask.sum() < max(1, min_loss_tokens):
+    if min_loss_tokens >= 0 and loss_mask.sum() < max(1, min_loss_tokens):
         return None
 
     packed = pack_loss_mask(loss_mask)

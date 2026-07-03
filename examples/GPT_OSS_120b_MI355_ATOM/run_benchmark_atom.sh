@@ -15,7 +15,7 @@ BENCH_SCRIPT="/home/danyzhan/Lumen-RL/examples/GPT_OSS_120b_MI355_ATOM/bench_eag
 OUTPUT_DIR="/home/danyzhan/Lumen-RL/examples/GPT_OSS_120b_MI355_ATOM/benchmark_results"
 PORT=8000
 SPEC_LENGTH=3
-STEP=15800
+STEP=63400
 
 # Forward extra args (e.g. --benchmarks all)
 EXTRA_ARGS="${@}"

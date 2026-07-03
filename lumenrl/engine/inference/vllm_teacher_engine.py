@@ -122,6 +122,17 @@ logger.info("Creating vLLM Engine (tp=%d, quant=%s, max_seq=%d)",
 
 from vllm import LLM, SamplingParams
 
+# Patch vLLM bug: HiddenStatesCacheSpec.merge() unconditionally raises even
+# for a single-element list.  Fixed upstream but not in 0.19.1+rocm721.
+import copy as _copy
+from vllm.model_executor.models.extract_hidden_states import HiddenStatesCacheSpec as _HSCS
+@classmethod
+def _hscs_merge(cls, specs):
+    if all(spec == specs[0] for spec in specs[1:]):
+        return _copy.deepcopy(specs[0])
+    raise AssertionError("HiddenStatesCacheSpec must not be merged with other layers")
+_HSCS.merge = _hscs_merge
+
 engine_kwargs = dict(
     model=model_path,
     tensor_parallel_size=tp_size,
@@ -277,6 +288,115 @@ for line in cmd_f:
         except OSError:
             pass
 
+    elif cmd == "generate_extract":
+        input_path = msg["input_path"]
+        max_tokens = msg.get("max_tokens", 2048)
+        temperature = msg.get("temperature", 0.0)
+
+        data = torch.load(input_path, map_location="cpu", weights_only=True)
+        input_ids = data["input_ids"]
+        attention_mask = data.get("attention_mask", None)
+
+        B, T_prompt = input_ids.shape
+        req_counter += 1
+
+        # Pass 1: Generate responses
+        # Cap per-prompt max_tokens so prompt + generated <= max_seq_len,
+        # matching NVIDIA's approach where max_seq_len bounds the full sequence.
+        gen_prompts = []
+        per_prompt_lens = []
+        for i in range(B):
+            if attention_mask is not None:
+                ids = input_ids[i][attention_mask[i].bool()].tolist()
+            else:
+                ids = input_ids[i].tolist()
+            gen_prompts.append({"prompt_token_ids": ids})
+            per_prompt_lens.append(len(ids))
+
+        per_prompt_max_tokens = [
+            max(1, min(max_tokens, max_seq_len - plen - 1))
+            for plen in per_prompt_lens
+        ]
+        # Use per-prompt SamplingParams when limits differ, else single params
+        if len(set(per_prompt_max_tokens)) == 1:
+            gen_sp_list = SamplingParams(max_tokens=per_prompt_max_tokens[0],
+                                         temperature=temperature)
+        else:
+            gen_sp_list = [
+                SamplingParams(max_tokens=mt, temperature=temperature)
+                for mt in per_prompt_max_tokens
+            ]
+        t0 = time.time()
+        gen_results = llm.generate(gen_prompts, gen_sp_list, use_tqdm=False)
+        gen_time = time.time() - t0
+
+        # Build full sequences (prompt + generated), truncate to max_seq_len - 1
+        # so Pass 2 prefill (prompt_len) + max_tokens(1) <= max_model_len.
+        max_full_len = max_seq_len - 1
+        full_prompts = []
+        full_ids_list = []
+        for i, output in enumerate(gen_results):
+            gen_ids = list(output.outputs[0].token_ids) if output.outputs else []
+            full_ids = list(output.prompt_token_ids) + gen_ids
+            if len(full_ids) > max_full_len:
+                full_ids = full_ids[:max_full_len]
+            full_prompts.append({"prompt_token_ids": full_ids})
+            full_ids_list.append(full_ids)
+
+        logger.info("generate_extract pass1: B=%d, gen_time=%.2fs, "
+                     "avg_gen_len=%.0f, max_gen_len=%d",
+                     B, gen_time,
+                     sum(len(f) for f in full_ids_list) / max(len(full_ids_list), 1),
+                     max(len(f) for f in full_ids_list))
+
+        # Pass 2: Extract hidden states via prefill on full sequences
+        t0 = time.time()
+        extract_results = llm.generate(full_prompts, sampling_params, use_tqdm=False)
+        extract_time = time.time() - t0
+
+        mooncake_keys = []
+        tensor_shapes_list = []
+        tensor_dtypes_list = []
+        seq_lens = []
+
+        for i, output in enumerate(extract_results):
+            kv_params = getattr(output, "kv_transfer_params", None)
+            if kv_params is None:
+                logger.error("No kv_transfer_params for generate_extract request %d", i)
+                continue
+
+            mooncake_key = kv_params.get("mooncake_key",
+                                         f"lumenrl_{os.getpid()}_{req_counter}_{i}")
+            shapes = kv_params.get("tensor_shapes", {})
+            dtypes = kv_params.get("tensor_dtypes", {})
+            prompt_tokens = len(output.prompt_token_ids)
+
+            mooncake_keys.append(mooncake_key)
+            tensor_shapes_list.append(shapes)
+            tensor_dtypes_list.append(dtypes)
+            seq_lens.append(prompt_tokens)
+
+        logger.info("generate_extract pass2: extract_time=%.2fs, seq_lens=%s",
+                     extract_time, seq_lens)
+
+        resp_f.write(json.dumps({
+            "status": "ok",
+            "B": B,
+            "T": max(seq_lens) if seq_lens else 0,
+            "hidden_size": hidden_size,
+            "num_aux_layers": num_aux,
+            "mooncake_keys": mooncake_keys,
+            "tensor_shapes": tensor_shapes_list,
+            "tensor_dtypes": tensor_dtypes_list,
+            "seq_lens": seq_lens,
+        }) + "\\n")
+        resp_f.flush()
+
+        try:
+            os.unlink(input_path)
+        except OSError:
+            pass
+
     elif cmd == "shutdown":
         if lm_head_path and os.path.exists(lm_head_path):
             os.unlink(lm_head_path)
@@ -312,6 +432,7 @@ class VllmTeacherEngine:
         max_seq_len: int = 4096,
         local_device: Optional[torch.device] = None,
         aux_layer_ids: Optional[list[int]] = None,
+        separate_last_hidden: bool = False,
     ):
         self._model_name = model_name
         self._gpu_ids = gpu_ids
@@ -324,6 +445,7 @@ class VllmTeacherEngine:
         # is the literal eagle_aux_hidden_state_layer_ids passed to vLLM ──
         # must match what the draft model was constructed for.
         self._aux_layer_ids_override = aux_layer_ids
+        self._separate_last_hidden = separate_last_hidden
         self._local_device = local_device or torch.device("cuda:0")
 
         self._proc: Optional[subprocess.Popen] = None
@@ -637,17 +759,17 @@ class VllmTeacherEngine:
                         nans_last, seq_len, i, key,
                     )
 
-                # cat() copies both tensors, so hs_concat survives buffer free.
-                hs_concat = torch.cat([hs_training, hs_last], dim=-1)  # [T, N*H]
-
-                all_hidden.append(hs_concat.unsqueeze(0))  # [1, T, N*H]
-                all_embeds.append(
-                    hs_concat[:, :hidden_size].unsqueeze(0)  # first aux as embed proxy
-                )
-                all_ids.append(output.input_ids.clone().unsqueeze(0))
-                # Use slice of hs_concat (already a copy) instead of hs_last
-                # (which wraps a Mooncake buffer freed by remove below).
-                all_last_hs.append(hs_concat[:, -hidden_size:].clone().unsqueeze(0))
+                if self._separate_last_hidden:
+                    all_hidden.append(hs_training.clone().unsqueeze(0))
+                    all_embeds.append(hs_training[:, :hidden_size].clone().unsqueeze(0))
+                    all_ids.append(output.input_ids.clone().unsqueeze(0))
+                    all_last_hs.append(hs_last.clone().unsqueeze(0))
+                else:
+                    hs_concat = torch.cat([hs_training, hs_last], dim=-1)
+                    all_hidden.append(hs_concat.unsqueeze(0))
+                    all_embeds.append(hs_concat[:, :hidden_size].unsqueeze(0))
+                    all_ids.append(output.input_ids.clone().unsqueeze(0))
+                    all_last_hs.append(hs_concat[:, -hidden_size:].clone().unsqueeze(0))
 
                 self._mooncake_store.remove_eagle3_tensors(
                     key, has_last_hidden_states=True, has_target=False,
@@ -659,6 +781,120 @@ class VllmTeacherEngine:
                 )
 
         # Pad variable-length results to max seq_len for batched training.
+        max_T = max(seq_lens)
+        D_hidden = all_hidden[0].shape[-1]
+        D_embed = all_embeds[0].shape[-1]
+        D_last = all_last_hs[0].shape[-1]
+        B_out = len(all_hidden)
+
+        hidden_states = torch.zeros(B_out, max_T, D_hidden, dtype=torch.bfloat16, device=recv_device)
+        token_embeds = torch.zeros(B_out, max_T, D_embed, dtype=torch.bfloat16, device=recv_device)
+        ret_ids = torch.zeros(B_out, max_T, dtype=torch.int64, device=recv_device)
+        last_hidden_states = torch.zeros(B_out, max_T, D_last, dtype=torch.bfloat16, device=recv_device)
+
+        for i in range(B_out):
+            slen = seq_lens[i]
+            hidden_states[i, :slen] = all_hidden[i].squeeze(0)
+            token_embeds[i, :slen] = all_embeds[i].squeeze(0)
+            ret_ids[i, :slen] = all_ids[i].squeeze(0)
+            last_hidden_states[i, :slen] = all_last_hs[i].squeeze(0)
+
+        return {
+            "hidden_states": hidden_states,
+            "token_embeds": token_embeds,
+            "input_ids": ret_ids,
+            "last_hidden_states": last_hidden_states,
+        }
+
+    def generate_and_extract_hidden_states(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+        recv_device: torch.device | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Generate response + extract hidden states in two passes.
+
+        Pass 1: Generate responses from prompt-only input.
+        Pass 2: Prefill on full sequences to capture hidden states.
+
+        Returns same format as extract_hidden_states().
+        """
+        if not self.is_alive:
+            self.start()
+
+        input_path = f"/dev/shm/lumenrl_vllm_input_{os.getpid()}.pt"
+        torch.save(
+            {"input_ids": input_ids.cpu(), "attention_mask": attention_mask.cpu()},
+            input_path,
+        )
+
+        resp = self._send_cmd({
+            "cmd": "generate_extract",
+            "input_path": input_path,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        })
+
+        if resp.get("status") != "ok":
+            raise RuntimeError(f"generate_extract failed: {resp}")
+
+        B = resp["B"]
+        hidden_size = resp["hidden_size"]
+        num_aux = resp["num_aux_layers"]
+        mooncake_keys = resp["mooncake_keys"]
+        seq_lens = resp["seq_lens"]
+
+        training_hidden_size = max(num_aux - 1, 1) * hidden_size
+
+        all_hidden = []
+        all_embeds = []
+        all_ids = []
+        all_last_hs = []
+
+        if recv_device is None:
+            recv_device = self._local_device
+
+        for i, key in enumerate(mooncake_keys):
+            seq_len = seq_lens[i]
+            shapes = {
+                "hidden_states": (seq_len, training_hidden_size),
+                "input_ids": (seq_len,),
+                "last_hidden_states": (seq_len, hidden_size),
+            }
+            dtypes = {
+                "hidden_states": torch.bfloat16,
+                "input_ids": torch.int64,
+                "last_hidden_states": torch.bfloat16,
+            }
+
+            if self._mooncake_store is not None:
+                output = self._mooncake_store.get(
+                    key, shapes, dtypes, device=recv_device,
+                )
+                hs_training = output.hidden_states
+                hs_last = output.last_hidden_states
+                if self._separate_last_hidden:
+                    all_hidden.append(hs_training.clone().unsqueeze(0))
+                    all_embeds.append(hs_training[:, :hidden_size].clone().unsqueeze(0))
+                    all_ids.append(output.input_ids.clone().unsqueeze(0))
+                    all_last_hs.append(hs_last.clone().unsqueeze(0))
+                else:
+                    hs_concat = torch.cat([hs_training, hs_last], dim=-1)
+                    all_hidden.append(hs_concat.unsqueeze(0))
+                    all_embeds.append(hs_concat[:, :hidden_size].unsqueeze(0))
+                    all_ids.append(output.input_ids.clone().unsqueeze(0))
+                    all_last_hs.append(hs_concat[:, -hidden_size:].clone().unsqueeze(0))
+
+                self._mooncake_store.remove_eagle3_tensors(
+                    key, has_last_hidden_states=True, has_target=False,
+                )
+            else:
+                raise RuntimeError(
+                    "Mooncake store not available for generate_extract."
+                )
+
         max_T = max(seq_lens)
         D_hidden = all_hidden[0].shape[-1]
         D_embed = all_embeds[0].shape[-1]

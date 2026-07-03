@@ -1,0 +1,153 @@
+{
+  "backend": "atom",
+  "target_model": "/dev/shm/gpt-oss-120b",
+  "draft_model": "/home/danyzhan/gpt_oss_120b_eagle3_HF",
+  "checkpoint_step": "15800",
+  "spec_length": 3,
+  "benchmarks": {
+    "mtbench_coding": {
+      "benchmark": "mtbench_coding",
+      "num_samples": 10,
+      "accept_length": 1.016,
+      "acceptance_rate": 0.5,
+      "total_output_tokens": 11288,
+      "throughput_tps": 165.0,
+      "latency_s": 68.4,
+      "num_draft_tokens": 33306,
+      "num_accepted": 176,
+      "distribution": {
+        "0": 10926,
+        "1": 176,
+        "2": 0,
+        "3": 0
+      },
+      "errors": 0
+    },
+    "mtbench_extraction": {
+      "benchmark": "mtbench_extraction",
+      "num_samples": 10,
+      "accept_length": 1.025,
+      "acceptance_rate": 0.8,
+      "total_output_tokens": 4160,
+      "throughput_tps": 192.8,
+      "latency_s": 21.6,
+      "num_draft_tokens": 12141,
+      "num_accepted": 103,
+      "distribution": {
+        "0": 3944,
+        "1": 103,
+        "2": 0,
+        "3": 0
+      },
+      "errors": 0
+    },
+    "mtbench_humanities": {
+      "benchmark": "mtbench_humanities",
+      "num_samples": 10,
+      "accept_length": 1.009,
+      "acceptance_rate": 0.3,
+      "total_output_tokens": 9800,
+      "throughput_tps": 202.8,
+      "latency_s": 48.3,
+      "num_draft_tokens": 29103,
+      "num_accepted": 89,
+      "distribution": {
+        "0": 9612,
+        "1": 89,
+        "2": 0,
+        "3": 0
+      },
+      "errors": 0
+    },
+    "mtbench_math": {
+      "benchmark": "mtbench_math",
+      "num_samples": 10,
+      "accept_length": 1.061,
+      "acceptance_rate": 2.0,
+      "total_output_tokens": 2597,
+      "throughput_tps": 183.9,
+      "latency_s": 14.1,
+      "num_draft_tokens": 7317,
+      "num_accepted": 148,
+      "distribution": {
+        "0": 2291,
+        "1": 148,
+        "2": 0,
+        "3": 0
+      },
+      "errors": 0
+    },
+    "mtbench_reasoning": {
+      "benchmark": "mtbench_reasoning",
+      "num_samples": 10,
+      "accept_length": 1.048,
+      "acceptance_rate": 1.6,
+      "total_output_tokens": 5838,
+      "throughput_tps": 206.6,
+      "latency_s": 28.3,
+      "num_draft_tokens": 16677,
+      "num_accepted": 269,
+      "distribution": {
+        "0": 5290,
+        "1": 269,
+        "2": 0,
+        "3": 0
+      },
+      "errors": 0
+    },
+    "mtbench_roleplay": {
+      "benchmark": "mtbench_roleplay",
+      "num_samples": 10,
+      "accept_length": 1.01,
+      "acceptance_rate": 0.3,
+      "total_output_tokens": 5711,
+      "throughput_tps": 199.5,
+      "latency_s": 28.6,
+      "num_draft_tokens": 16938,
+      "num_accepted": 55,
+      "distribution": {
+        "0": 5591,
+        "1": 55,
+        "2": 0,
+        "3": 0
+      },
+      "errors": 0
+    },
+    "mtbench_stem": {
+      "benchmark": "mtbench_stem",
+      "num_samples": 10,
+      "accept_length": 1.005,
+      "acceptance_rate": 0.2,
+      "total_output_tokens": 10244,
+      "throughput_tps": 204.4,
+      "latency_s": 50.1,
+      "num_draft_tokens": 30561,
+      "num_accepted": 47,
+      "distribution": {
+        "0": 10140,
+        "1": 47,
+        "2": 0,
+        "3": 0
+      },
+      "errors": 0
+    },
+    "mtbench_writing": {
+      "benchmark": "mtbench_writing",
+      "num_samples": 10,
+      "accept_length": 1.011,
+      "acceptance_rate": 0.4,
+      "total_output_tokens": 3725,
+      "throughput_tps": 187.1,
+      "latency_s": 19.9,
+      "num_draft_tokens": 11019,
+      "num_accepted": 42,
+      "distribution": {
+        "0": 3631,
+        "1": 42,
+        "2": 0,
+        "3": 0
+      },
+      "errors": 0
+    }
+  }
+}

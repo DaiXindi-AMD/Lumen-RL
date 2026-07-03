@@ -75,7 +75,7 @@ _TEACHER_WORKER_SCRIPT = textwrap.dedent("""\
 import gc, json, os, sys, logging, time, socket, glob
 
 # ---- Ensure lumenrl is importable (for ATOM's fallback imports) ----
-for _p in ["/root/lumenrl", os.getcwd()]:
+for _p in ["/root/lumenrl/third_party/ATOM", "/root/lumenrl", os.getcwd()]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -182,6 +182,11 @@ logger.info("AsyncLLMEngine created successfully")
 # ---- Configure hidden states extraction ----
 aux_layer_ids = [1, num_layers // 2 - 1, num_layers - 4]
 max_seq = engine_kwargs.get("max_model_len", max_seq)
+from lumenrl.transfer.eagle_mooncake_store import calculate_eagle3_buffer_size
+host_buf_size = calculate_eagle3_buffer_size(
+    max_seq_len=max_seq, batch_size=max_batch,
+    hidden_dim=hidden_dim, safety_margin=2.0,
+)
 mooncake_config = {
     "local_hostname": os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
     "metadata_server": os.environ.get("MOONCAKE_METADATA_SERVER", ""),
@@ -196,9 +201,11 @@ mooncake_config = {
     "enable_hard_pin": os.environ.get("MOONCAKE_ENABLE_HARD_PIN", "0") == "1",
     "max_seq_len": max_seq,
     "hidden_dim": hidden_dim,
+    "host_buffer_size": host_buf_size,
 }
-engine.configure_hidden_states(aux_layer_ids, mooncake_config)
-logger.info("Hidden states configured: aux_layers=%s", aux_layer_ids)
+capture_mode = os.environ.get("LUMENRL_CAPTURE_MODE", "postnorm")
+engine.configure_hidden_states(aux_layer_ids, mooncake_config, capture_mode=capture_mode)
+logger.info("Hidden states configured: aux_layers=%s, capture_mode=%s", aux_layer_ids, capture_mode)
 
 # ---- Signal ready ----
 resp_f = open(resp_fifo, "w")
@@ -239,6 +246,45 @@ for line in cmd_f:
         resp_f.write(json.dumps({
             "status": "ok", "B": B, "T": T, "D": hidden_dim,
             "mooncake_keys": data_ids,
+        }) + "\\n")
+        resp_f.flush()
+        del data, input_ids_batch, input_ids_list
+
+    elif cmd == "generate_extract":
+        input_path = msg["input_path"]
+        max_tokens = msg.get("max_tokens", 2048)
+        temperature = msg.get("temperature", 0.0)
+        data = torch.load(input_path, map_location="cpu", weights_only=True)
+        input_ids_batch = data["input_ids"]
+        attn_mask = data.get("attention_mask")
+        B = input_ids_batch.shape[0]
+        req_counter += 1
+
+        input_ids_list = []
+        for i in range(B):
+            ids = input_ids_batch[i]
+            if attn_mask is not None:
+                valid_len = int(attn_mask[i].sum().item())
+                ids = ids[:valid_len]
+            else:
+                while len(ids) > 0 and ids[-1].item() == 0:
+                    ids = ids[:-1]
+            input_ids_list.append(ids.tolist())
+        data_ids = [f"atom_{os.getpid()}_{req_counter}_{i}" for i in range(B)]
+
+        from atom.sampling_params import SamplingParams
+        sp = SamplingParams(max_tokens=max_tokens, temperature=temperature)
+
+        t0 = time.monotonic()
+        results = engine.generate_with_hidden_states(input_ids_list, data_ids, sp)
+        elapsed = time.monotonic() - t0
+        logger.info("generate_extract: B=%d, max_tokens=%d, %.2fs", B, max_tokens, elapsed)
+
+        seq_lens = {r["data_id"]: r["seq_len"] for r in results}
+        resp_f.write(json.dumps({
+            "status": "ok", "B": B, "D": hidden_dim,
+            "mooncake_keys": data_ids,
+            "seq_lens": seq_lens,
         }) + "\\n")
         resp_f.flush()
         del data, input_ids_batch, input_ids_list
@@ -284,6 +330,7 @@ class AtomTeacherEngine:
         max_batch_size: int = 32,
         max_seq_len: int = 4096,
         local_device: torch.device | None = None,
+        capture_mode: str = "postnorm",
     ) -> None:
         self._model_name = model_name
         self._tp_size = tensor_parallel_size
@@ -296,6 +343,7 @@ class AtomTeacherEngine:
         self._max_batch = max_batch_size
         self._max_seq = max_seq_len
         self._local_device = local_device or torch.device("cuda:0")
+        self._capture_mode = capture_mode
 
         self._proc: subprocess.Popen | None = None
         self._fifo_dir: str | None = None
@@ -550,6 +598,8 @@ class AtomTeacherEngine:
         attn_backend = os.environ.get("VLLM_ROCM_ATTN_BACKEND")
         if attn_backend:
             env["VLLM_ROCM_ATTN_BACKEND"] = attn_backend
+
+        env["LUMENRL_CAPTURE_MODE"] = self._capture_mode
 
         # Set Mooncake env vars for worker subprocess
         if self._transport == "mooncake" and self._mooncake_config is not None:
@@ -845,6 +895,151 @@ class AtomTeacherEngine:
             }
         else:
             raise AssertionError("MORI-IO transport not implemented for 3 aux layers")
+
+    def generate_and_extract_hidden_states(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+        recv_device: torch.device | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Generate response + extract hidden states in one pass.
+
+        Unlike extract_hidden_states() which does prefill-only on full
+        sequences, this method sends prompt-only tokens to the teacher,
+        generates a response, and captures hidden states at every position
+        (prompt + generated tokens).
+
+        Args:
+            input_ids: ``[B, T_prompt]`` prompt-only token ids.
+            attention_mask: ``[B, T_prompt]`` mask (1 = valid, 0 = pad).
+            max_tokens: Maximum tokens to generate per request.
+            temperature: Sampling temperature (0.0 = greedy).
+            recv_device: Device for received tensors.
+
+        Returns:
+            Same format as extract_hidden_states() — dict with
+            ``hidden_states`` ``[B, T_max, 3*D]``,
+            ``token_embeds`` ``[B, T_max, D]``,
+            ``last_hidden_states`` ``[B, T_max, D]``,
+            ``input_ids`` ``[B, T_max]``.
+            T_max = max(prompt_len + generated_len) across batch, padded.
+        """
+        if not self.is_alive:
+            self.start()
+
+        with self._cmd_lock:
+            self._req_counter += 1
+            tag = f"req_{self._req_counter}"
+            input_path = os.path.join(self._hidden_dir, f"{tag}_input.pt")
+
+            torch.save(
+                {"input_ids": input_ids.cpu(), "attention_mask": attention_mask.cpu()},
+                input_path,
+            )
+
+            resp = self._send_cmd_unlocked({
+                "cmd": "generate_extract",
+                "input_path": input_path,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            })
+
+        if resp.get("status") != "ok":
+            raise RuntimeError(f"generate_extract failed: {resp}")
+
+        B = resp["B"]
+        D = resp["D"]
+
+        if recv_device is None:
+            recv_device = self._local_device
+
+        if self._transport == "mooncake":
+            mooncake_keys = resp["mooncake_keys"]
+            seq_lens = resp.get("seq_lens", {})
+            num_aux = len(self._aux_layer_indices)
+            training_hidden_size = num_aux * D
+
+            all_hs = []
+            all_ids = []
+            all_last_hs = []
+            all_seq_lens = []
+
+            for key in mooncake_keys:
+                T_i = seq_lens.get(key)
+                if T_i is None:
+                    raise RuntimeError(
+                        f"Missing seq_len for key={key} in generate_extract response"
+                    )
+                all_seq_lens.append(T_i)
+
+                shapes = {
+                    "hidden_states": (T_i, training_hidden_size),
+                    "input_ids": (T_i,),
+                    "last_hidden_states": (T_i, D),
+                }
+                dtypes = {
+                    "hidden_states": torch.bfloat16,
+                    "input_ids": torch.int64,
+                    "last_hidden_states": torch.bfloat16,
+                }
+
+                output = self._mooncake_store.get(
+                    key, shapes, dtypes, device=recv_device,
+                )
+
+                all_hs.append(output.hidden_states)
+                all_last_hs.append(output.last_hidden_states)
+                all_ids.append(output.input_ids)
+
+                self._mooncake_store.remove_eagle3_tensors(
+                    key, has_last_hidden_states=True, has_target=False,
+                )
+
+            T_max = max(all_seq_lens)
+            pad_id = 0
+
+            def _pad_2d(tensors, T_max):
+                padded = []
+                for t in tensors:
+                    if t.shape[0] < T_max:
+                        pad = torch.zeros(
+                            T_max - t.shape[0], *t.shape[1:],
+                            dtype=t.dtype, device=t.device,
+                        )
+                        padded.append(torch.cat([t, pad], dim=0))
+                    else:
+                        padded.append(t)
+                return torch.stack(padded)
+
+            def _pad_1d(tensors, T_max, fill=0):
+                padded = []
+                for t in tensors:
+                    if t.shape[0] < T_max:
+                        pad = torch.full(
+                            (T_max - t.shape[0],), fill,
+                            dtype=t.dtype, device=t.device,
+                        )
+                        padded.append(torch.cat([t, pad], dim=0))
+                    else:
+                        padded.append(t)
+                return torch.stack(padded)
+
+            hidden_states = _pad_2d(all_hs, T_max)
+            last_hidden_states = _pad_2d(all_last_hs, T_max)
+            ret_ids = _pad_1d(all_ids, T_max, fill=pad_id)
+
+            token_embeds = hidden_states[:, :, :D].clone()
+
+            return {
+                "hidden_states": hidden_states,
+                "token_embeds": token_embeds,
+                "input_ids": ret_ids,
+                "last_hidden_states": last_hidden_states,
+            }
+        else:
+            raise AssertionError("MORI-IO transport not implemented for generate_extract")
 
     def get_lm_head_weight(self) -> torch.Tensor:
         """Load the teacher's lm_head.weight from shared memory."""

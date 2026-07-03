@@ -23,10 +23,10 @@ MAX_ATTEMPTS="${MAX_ATTEMPTS:-30}"
 RETRY_SLEEP="${RETRY_SLEEP:-30}"
 HANG_IDLE_SEC="${HANG_IDLE_SEC:-600}"
 WATCHDOG_POLL_SEC="${WATCHDOG_POLL_SEC:-30}"
-CONTAINER_NAME="${CONTAINER_NAME:-gpt_oss_120b_eagle3_mi350}"
+CONTAINER_NAME="${CONTAINER_NAME:-gpt_oss_120b_eagle3_mi355}"
 
 LOG_DIR="${REPO_ROOT}/output/GPT_OSS_120b_SDDD/LumenRL"
-LOG_FILE="${LOG_DIR}/gpt-oss-120b-eagle3-mi350.log"
+LOG_FILE="${LOG_DIR}/gpt-oss-120b-eagle3-mi355.log"
 SUCCESS_RE='SpecDistillTrainer\.train finished after [0-9]+ steps'
 
 mkdir -p "${LOG_DIR}"
@@ -67,13 +67,13 @@ while [ "${attempt}" -lt "${MAX_ATTEMPTS}" ]; do
     wait "${wd_pid}" 2>/dev/null || true
 
     if [ -f "${LOG_FILE}" ]; then
-        rotated="${LOG_DIR}/gpt-oss-120b-eagle3-mi350.attempt-$(printf '%02d' "${attempt}").log"
+        rotated="${LOG_DIR}/gpt-oss-120b-eagle3-mi355.attempt-$(printf '%02d' "${attempt}").log"
         cp "${LOG_FILE}" "${rotated}" 2>/dev/null || true
     fi
 
     # Reap GPU coredumps
     if ls "${REPO_ROOT}"/gpucore.*.gpu >/dev/null 2>&1; then
-        docker run --rm -v "${REPO_ROOT}":/host "${DOCKER_IMAGE:-lumenrl-vllm-mi350:latest}" \
+        docker run --rm -v "${REPO_ROOT}":/host "${DOCKER_IMAGE:-gpt_oss_eagle3_train:latest}" \
             bash -c 'rm -f /host/gpucore.*.gpu' >/dev/null 2>&1 || true
         echo "[retry-wrapper] reaped GPU coredump files in ${REPO_ROOT}"
     fi

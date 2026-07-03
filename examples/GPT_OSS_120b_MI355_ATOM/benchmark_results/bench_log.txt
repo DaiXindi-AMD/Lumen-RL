@@ -1,0 +1,114 @@
+Using model: /dev/shm/gpt-oss-120b
+Backend: ATOM
+Spec length (draft_length): 3
+Batch size: 1
+Detected num_speculative_tokens: 3
+
+======================================================================
+MT-BENCH PER-CATEGORY EVALUATION (matching NVIDIA evaluation)
+======================================================================
+Downloading mtbench.jsonl...
+
+============================================================
+Running: mtbench_coding (10 samples, BS=1)
+============================================================
+  Accept length: 1.018
+  Acceptance rate: 0.6%
+  Throughput: 201.1 tok/s
+  Total time: 47.6s
+  Distribution: {'0': 9222, '1': 172, '2': 0, '3': 0}
+
+============================================================
+Running: mtbench_extraction (10 samples, BS=1)
+============================================================
+  Accept length: 1.023
+  Acceptance rate: 0.8%
+  Throughput: 190.8 tok/s
+  Total time: 22.9s
+  Distribution: {'0': 4160, '1': 96, '2': 0, '3': 0}
+
+============================================================
+Running: mtbench_humanities (10 samples, BS=1)
+============================================================
+  Accept length: 1.005
+  Acceptance rate: 0.2%
+  Throughput: 198.6 tok/s
+  Total time: 46.2s
+  Distribution: {'0': 9085, '1': 42, '2': 0, '3': 0}
+
+============================================================
+Running: mtbench_math (10 samples, BS=1)
+============================================================
+  Accept length: 1.060
+  Acceptance rate: 2.0%
+  Throughput: 180.7 tok/s
+  Total time: 13.5s
+  Distribution: {'0': 2158, '1': 138, '2': 0, '3': 0}
+
+============================================================
+Running: mtbench_reasoning (10 samples, BS=1)
+============================================================
+  Accept length: 1.014
+  Acceptance rate: 0.5%
+  Throughput: 188.7 tok/s
+  Total time: 19.5s
+  Distribution: {'0': 3565, '1': 52, '2': 0, '3': 0}
+
+============================================================
+Running: mtbench_roleplay (10 samples, BS=1)
+============================================================
+  Accept length: 1.013
+  Acceptance rate: 0.4%
+  Throughput: 187.9 tok/s
+  Total time: 19.8s
+  Distribution: {'0': 3605, '1': 48, '2': 0, '3': 0}
+
+============================================================
+Running: mtbench_stem (10 samples, BS=1)
+============================================================
+  Accept length: 1.006
+  Acceptance rate: 0.2%
+  Throughput: 201.8 tok/s
+  Total time: 44.0s
+  Distribution: {'0': 8776, '1': 50, '2': 0, '3': 0}
+
+============================================================
+Running: mtbench_writing (10 samples, BS=1)
+============================================================
+  Accept length: 1.011
+  Acceptance rate: 0.4%
+  Throughput: 193.9 tok/s
+  Total time: 23.1s
+  Distribution: {'0': 4374, '1': 47, '2': 0, '3': 0}
+
+======================================================================
+MT-BENCH SUMMARY (NVIDIA comparison: draft_length=3)
+======================================================================
+Category              Ours     NVIDIA      Delta
+---------------------------------------------
+coding               1.018       2.51     -1.492
+extraction           1.023       2.53     -1.507
+humanities           1.005       1.95     -0.945
+math                 1.060       2.83     -1.770
+reasoning            1.014       2.47     -1.456
+roleplay             1.013       2.25     -1.237
+stem                 1.006       2.17     -1.164
+writing              1.011       2.24     -1.229
+---------------------------------------------
+AVERAGE              1.019       2.37     -1.350
+
+Results saved to /workspace/results/atom_eagle3_step15800_20260609_033026.json
+
+======================================================================
+Benchmark                     n   Accept Len   Acc Rate    Tok/s
+======================================================================
+mtbench_coding               10        1.018       0.6%    201.1
+mtbench_extraction           10        1.023       0.8%    190.8
+mtbench_humanities           10        1.005       0.2%    198.6
+mtbench_math                 10        1.060       2.0%    180.7
+mtbench_reasoning            10        1.014       0.5%    188.7
+mtbench_roleplay             10        1.013       0.4%    187.9
+mtbench_stem                 10        1.006       0.2%    201.8
+mtbench_writing              10        1.011       0.4%    193.9
+======================================================================
+AVERAGE                                1.019       0.6%

@@ -496,10 +496,12 @@ class Eagle3Model(nn.Module):
         rope_theta: float = 1000000.0,
         num_kv_heads: Optional[int] = None,
         rope_scaling: Optional[dict] = None,
+        shift_input_embeds: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.length = length
+        self._shift_input_embeds = shift_input_embeds
 
         num_kv_heads = num_kv_heads or num_heads
         ffn_dim = ffn_dim or hidden_dim * 4
@@ -535,21 +537,21 @@ class Eagle3Model(nn.Module):
         attention_mask: Optional[Tensor] = None,
     ) -> dict[str, Tensor]:
         """
-        Aligned with TorchSpec Eagle3Model.forward:
-        - Off-policy: input_ids left-shifted each step (ground truth, not draft predictions)
-        - loss_mask left-shifted each step
-        - target_hidden_states indexed by step (not step+1)
-        - hidden_states (h) pass between steps (not reset)
+        Aligned with Model-Optimizer HFEagleModel.forward:
+        - token_embeds: fixed across all TTT steps (shifted left by 1 in caller)
+        - hidden states rolled right by 1 between TTT steps
+        - loss slicing: draft[:, step:-1] vs teacher[:, 1+step:]
 
         Args:
-            token_embeds: [B, T, H] — from F.embedding(input_ids, embed_weight)
+            token_embeds: [B, T, H] — embed(input_ids.roll(-1, 1)), fixed across steps
             aux_hidden_states: [B, T, 3*H] — concatenated 3 aux teacher hidden states
-            teacher_lm_head_weight: [V, H] — teacher lm_head (frozen, for teacher logits only)
-            embed_weight: [V, H] — teacher embed_tokens (for off-policy embedding each step)
-            loss_mask: [B, T] — mask for valid positions (left-shifted each step)
-            target_ids: [B, T] — input token ids (left-shifted each step for off-policy)
+            teacher_lm_head_weight: [V, H] — teacher lm_head (frozen)
+            embed_weight: [V, H] — unused (kept for API compat)
+            loss_mask: [B, T] — mask for valid positions
+            target_ids: [B, T] — unused (kept for API compat)
             loss_type: "cross_entropy" or "forward_kl"
-            target_hidden_states: [B, T+length, H] — teacher last hidden states (post-norm)
+            target_hidden_states: [B, T, H] — teacher last hidden states (must be
+                post-norm; caller applies teacher final RMSNorm if needed)
             attention_mask: [B, T] — 1 for real tokens, 0 for padding
         """
         B, T, D = token_embeds.shape
@@ -558,125 +560,182 @@ class Eagle3Model(nn.Module):
         accuracies: list[Tensor] = []
 
         position_ids = torch.arange(T, device=token_embeds.device).unsqueeze(0).expand(B, -1)
-
-        # Pass raw 2D mask — Eagle3Attention routes to flash attention or builds
-        # 4D mask internally as needed
         attn_mask = attention_mask
-
-        if target_hidden_states is not None:
-            target_hidden_states = F.pad(target_hidden_states, (0, 0, 0, self.length), value=0.0)
-
         h = self.fc(aux_hidden_states)
-
-        current_ids = target_ids
-        if current_ids is not None and embed_weight is not None:
-            current_ids = current_ids.clamp(min=0, max=embed_weight.shape[0] - 1)
-        current_mask = loss_mask
-
         cache_keys = None
         cache_values = None
 
-        for step in range(self.length):
-            for layer in self.layers:
-                h, cache_keys, cache_values = layer(
-                    input_emb=token_embeds, hidden_states=h,
-                    position_ids=position_ids, attn_mask=attn_mask,
-                    cache_keys=cache_keys, cache_values=cache_values,
-                    use_cache=True,
-                )
+        if self._shift_input_embeds:
+            # === NV Model-Optimizer aligned path (GPT-OSS-120B) ===
+            for step in range(self.length):
+                for layer in self.layers:
+                    h, cache_keys, cache_values = layer(
+                        input_emb=token_embeds, hidden_states=h,
+                        position_ids=position_ids, attn_mask=attn_mask,
+                        cache_keys=cache_keys, cache_values=cache_values,
+                        use_cache=True,
+                    )
 
-            _fused_fn = getattr(self, '_fused_kl_loss_fn', None)
-            if (_fused_fn is not None
-                    and loss_type == "forward_kl"
-                    and target_hidden_states is not None
-                    and current_mask is not None):
-                ths = target_hidden_states[:, step:step + T]
-                loss, acc = _fused_fn(
-                    draft_hidden_states=h,
-                    target_hidden_states=ths,
-                    loss_mask=current_mask[:, :T],
-                    norm_weight=self.out_norm.weight,
-                    draft_lm_head_weight=teacher_lm_head_weight,
-                    target_lm_head_weight=teacher_lm_head_weight,
-                    norm_eps=getattr(self.out_norm, 'eps', getattr(self.out_norm, 'variance_epsilon', 1e-6)),
-                )
-                losses.append(loss)
-                accuracies.append(acc)
-            else:
                 normed = self.out_norm(h)
+                draft_normed = normed[:, step:T - 1]
+                step_mask = loss_mask[:, 1 + step:T] if loss_mask is not None else None
 
-                if current_mask is not None:
-                    hs_flat = normed.reshape(-1, D)
-                    mask_flat = current_mask[:, :T].reshape(-1).bool()
+                N_valid = 0
+                if step_mask is not None:
+                    mask_flat = step_mask.reshape(-1).bool()
                     valid_idx = mask_flat.nonzero(as_tuple=True)[0]
-
                     N_valid = valid_idx.shape[0]
-                    if N_valid > 0:
-                        normed_valid = hs_flat.index_select(0, valid_idx)
 
-                        draft_lm_head_w = teacher_lm_head_weight
+                if N_valid > 0:
+                    draft_flat = draft_normed.reshape(-1, D)
+                    normed_valid = draft_flat.index_select(0, valid_idx)
 
-                        if loss_type == "forward_kl" and target_hidden_states is not None:
-                            ths = target_hidden_states[:, step:step + T]
-                            ths_flat = ths.reshape(-1, target_hidden_states.shape[-1])
-                            ths_valid = ths_flat.index_select(0, valid_idx)
+                    if loss_type == "forward_kl" and target_hidden_states is not None:
+                        ths = target_hidden_states[:, 1 + step:T]
+                        ths_flat = ths.reshape(-1, target_hidden_states.shape[-1])
+                        ths_valid = ths_flat.index_select(0, valid_idx)
 
-                            CHUNK = 512
-                            kl_parts: list[Tensor] = []
-                            acc_parts: list[Tensor] = []
-                            for cs in range(0, N_valid, CHUNK):
-                                ce = min(cs + CHUNK, N_valid)
-                                with torch.no_grad():
-                                    teacher_logits = F.linear(ths_valid[cs:ce], teacher_lm_head_weight)
-                                    tp = F.softmax(teacher_logits.float(), dim=-1)
-                                    teacher_pred = teacher_logits.argmax(dim=-1)
-                                    del teacher_logits
-                                draft_logits = F.linear(normed_valid[cs:ce], draft_lm_head_w)
-                                logits_f32 = draft_logits.float()
-                                kl_parts.append(torch.logsumexp(logits_f32, dim=-1) - (tp * logits_f32).sum(-1))
-                                acc_parts.append((draft_logits.argmax(dim=-1) == teacher_pred).float())
-                                del tp, draft_logits, logits_f32
-                            losses.append(torch.cat(kl_parts).sum() / max(N_valid, 1))
-                            accuracies.append(torch.cat(acc_parts).sum() / max(N_valid, 1))
-                        elif current_ids is not None:
-                            tgt_flat = current_ids[:, :T].reshape(-1)
-                            tgt_valid = tgt_flat.index_select(0, valid_idx)
-                            logits_valid = F.linear(normed_valid, draft_lm_head_w)
-                            ce_valid = F.cross_entropy(logits_valid.float(), tgt_valid, reduction="none")
-                            acc_valid = (logits_valid.argmax(dim=-1) == tgt_valid).float()
-                            losses.append(ce_valid.sum() / max(N_valid, 1))
-                            accuracies.append(acc_valid.sum() / max(N_valid, 1))
-                            del logits_valid
-
-            if step < self.length - 1:
-                # Off-policy left-shift (TorchSpec: padding(input_ids, left=False))
-                if current_ids is not None:
-                    current_ids = torch.cat(
-                        (current_ids[:, 1:], torch.zeros_like(current_ids[:, :1])),
-                        dim=1,
-                    )
-                if current_mask is not None:
-                    current_mask = torch.cat(
-                        (current_mask[:, 1:], torch.zeros_like(current_mask[:, :1])),
-                        dim=1,
-                    )
-                if embed_weight is not None and current_ids is not None:
-                    token_embeds = F.embedding(current_ids[:, :T], embed_weight)
+                        CHUNK = 512
+                        kl_parts: list[Tensor] = []
+                        acc_parts: list[Tensor] = []
+                        for cs in range(0, N_valid, CHUNK):
+                            ce = min(cs + CHUNK, N_valid)
+                            with torch.no_grad():
+                                teacher_logits = F.linear(ths_valid[cs:ce], teacher_lm_head_weight)
+                                tp = F.softmax(teacher_logits.float(), dim=-1)
+                                teacher_pred = teacher_logits.argmax(dim=-1)
+                                del teacher_logits
+                            draft_logits = F.linear(normed_valid[cs:ce], teacher_lm_head_weight)
+                            log_q = F.log_softmax(draft_logits.float(), dim=-1)
+                            kl_parts.append(-(tp * log_q).sum(-1))
+                            acc_parts.append((draft_logits.argmax(dim=-1) == teacher_pred).float())
+                            del tp, draft_logits, log_q
+                        losses.append(torch.cat(kl_parts).sum() / N_valid)
+                        accuracies.append(torch.cat(acc_parts).sum() / N_valid)
+                    elif target_ids is not None:
+                        tgt = target_ids[:, 1 + step:T].reshape(-1)
+                        tgt_valid = tgt.index_select(0, valid_idx)
+                        logits_valid = F.linear(normed_valid, teacher_lm_head_weight)
+                        ce_valid = F.cross_entropy(logits_valid.float(), tgt_valid, reduction="none")
+                        acc_valid = (logits_valid.argmax(dim=-1) == tgt_valid).float()
+                        losses.append(ce_valid.sum() / N_valid)
+                        accuracies.append(acc_valid.sum() / N_valid)
+                        del logits_valid
+                    else:
+                        losses.append(torch.zeros(1, device=h.device))
+                        accuracies.append(torch.zeros(1, device=h.device))
                 else:
-                    token_embeds = torch.cat(
-                        (token_embeds[:, 1:], torch.zeros_like(token_embeds[:, :1])),
-                        dim=1,
+                    zero = (normed.sum()) * 0.0
+                    losses.append(zero)
+                    accuracies.append(torch.zeros(1, device=h.device))
+
+                if step < self.length - 1:
+                    h = h.roll(1, 1)
+        else:
+            # === Original TorchSpec path (Kimi K2.5) ===
+            if target_hidden_states is not None:
+                target_hidden_states = F.pad(target_hidden_states, (0, 0, 0, self.length), value=0.0)
+
+            current_ids = target_ids
+            if current_ids is not None and embed_weight is not None:
+                current_ids = current_ids.clamp(min=0, max=embed_weight.shape[0] - 1)
+            current_mask = loss_mask
+
+            for step in range(self.length):
+                for layer in self.layers:
+                    h, cache_keys, cache_values = layer(
+                        input_emb=token_embeds, hidden_states=h,
+                        position_ids=position_ids, attn_mask=attn_mask,
+                        cache_keys=cache_keys, cache_values=cache_values,
+                        use_cache=True,
                     )
+
+                _fused_fn = getattr(self, '_fused_kl_loss_fn', None)
+                if (_fused_fn is not None
+                        and loss_type == "forward_kl"
+                        and target_hidden_states is not None
+                        and current_mask is not None):
+                    ths = target_hidden_states[:, step:step + T]
+                    loss, acc = _fused_fn(
+                        draft_hidden_states=h,
+                        target_hidden_states=ths,
+                        loss_mask=current_mask[:, :T],
+                        norm_weight=self.out_norm.weight,
+                        draft_lm_head_weight=teacher_lm_head_weight,
+                        target_lm_head_weight=teacher_lm_head_weight,
+                        norm_eps=getattr(self.out_norm, 'eps', getattr(self.out_norm, 'variance_epsilon', 1e-6)),
+                    )
+                    losses.append(loss)
+                    accuracies.append(acc)
+                else:
+                    normed = self.out_norm(h)
+
+                    if current_mask is not None:
+                        hs_flat = normed.reshape(-1, D)
+                        mask_flat = current_mask[:, :T].reshape(-1).bool()
+                        valid_idx = mask_flat.nonzero(as_tuple=True)[0]
+
+                        N_valid = valid_idx.shape[0]
+                        if N_valid > 0:
+                            normed_valid = hs_flat.index_select(0, valid_idx)
+
+                            if loss_type == "forward_kl" and target_hidden_states is not None:
+                                ths = target_hidden_states[:, step:step + T]
+                                ths_flat = ths.reshape(-1, target_hidden_states.shape[-1])
+                                ths_valid = ths_flat.index_select(0, valid_idx)
+
+                                CHUNK = 512
+                                kl_parts: list[Tensor] = []
+                                acc_parts: list[Tensor] = []
+                                for cs in range(0, N_valid, CHUNK):
+                                    ce = min(cs + CHUNK, N_valid)
+                                    with torch.no_grad():
+                                        teacher_logits = F.linear(ths_valid[cs:ce], teacher_lm_head_weight)
+                                        tp = F.softmax(teacher_logits.float(), dim=-1)
+                                        teacher_pred = teacher_logits.argmax(dim=-1)
+                                        del teacher_logits
+                                    draft_logits = F.linear(normed_valid[cs:ce], teacher_lm_head_weight)
+                                    logits_f32 = draft_logits.float()
+                                    kl_parts.append(torch.logsumexp(logits_f32, dim=-1) - (tp * logits_f32).sum(-1))
+                                    acc_parts.append((draft_logits.argmax(dim=-1) == teacher_pred).float())
+                                    del tp, draft_logits, logits_f32
+                                losses.append(torch.cat(kl_parts).sum() / max(N_valid, 1))
+                                accuracies.append(torch.cat(acc_parts).sum() / max(N_valid, 1))
+                            elif current_ids is not None:
+                                tgt_flat = current_ids[:, :T].reshape(-1)
+                                tgt_valid = tgt_flat.index_select(0, valid_idx)
+                                logits_valid = F.linear(normed_valid, teacher_lm_head_weight)
+                                ce_valid = F.cross_entropy(logits_valid.float(), tgt_valid, reduction="none")
+                                acc_valid = (logits_valid.argmax(dim=-1) == tgt_valid).float()
+                                losses.append(ce_valid.sum() / max(N_valid, 1))
+                                accuracies.append(acc_valid.sum() / max(N_valid, 1))
+                                del logits_valid
+
+                if step < self.length - 1:
+                    if current_ids is not None:
+                        current_ids = torch.cat(
+                            (current_ids[:, 1:], torch.zeros_like(current_ids[:, :1])),
+                            dim=1,
+                        )
+                    if current_mask is not None:
+                        current_mask = torch.cat(
+                            (current_mask[:, 1:], torch.zeros_like(current_mask[:, :1])),
+                            dim=1,
+                        )
+                    if embed_weight is not None and current_ids is not None:
+                        token_embeds = F.embedding(current_ids[:, :T], embed_weight)
+                    else:
+                        token_embeds = torch.cat(
+                            (token_embeds[:, 1:], torch.zeros_like(token_embeds[:, :1])),
+                            dim=1,
+                        )
 
         result: dict[str, Tensor] = {"logits_list": logits_list}
         if losses:
             result["losses"] = losses
             result["accuracies"] = accuracies
         else:
-            # Zero valid tokens across all steps (e.g. FSDP rank with all-padding
-            # micro-batch).  Return a zero loss connected to the compute graph so
-            # backward still runs and FSDP all-reduce doesn't hang.
-            zero = h.sum() * 0.0
+            zero = (h.sum() + self.out_norm.weight.sum()) * 0.0
             result["losses"] = [zero] * self.length
             result["accuracies"] = [torch.zeros(1, device=h.device)] * self.length
         return result

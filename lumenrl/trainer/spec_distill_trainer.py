@@ -56,15 +56,28 @@ class _TeacherPrefetcher:
         self._worker.start()
 
     def _loop(self) -> None:
+        teacher_cfg = self._trainer.config.algorithm.teacher
+        generate_mode = getattr(teacher_cfg, "generate_mode", "prefill")
+        pad_id = self._trainer._tokenizer.pad_token_id or 0
         while True:
             step = self._req_queue.get()
             if step is _PREFETCH_SENTINEL:
                 break
             try:
                 ids, mask, loss_mask = self._trainer._get_batch_sequences(step)
-                data = self._trainer._teacher_inference_rank0(
-                    ids, mask, recv_device=torch.device("cpu"),
-                )
+                if generate_mode == "generate":
+                    data = self._trainer._teacher_generate_and_extract_rank0(
+                        ids, mask, recv_device=torch.device("cpu"),
+                    )
+                    if data is not None and "input_ids" in data:
+                        gen_ids = data["input_ids"]
+                        mask = (gen_ids != pad_id).long()
+                        loss_mask = mask.clone()
+                        ids = gen_ids
+                else:
+                    data = self._trainer._teacher_inference_rank0(
+                        ids, mask, recv_device=torch.device("cpu"),
+                    )
                 self._res_queue.put((data, ids, mask, loss_mask))
             except Exception as e:
                 self._res_queue.put(e)
@@ -434,6 +447,7 @@ class SpecDistillTrainer:
                 rope_theta=rope_theta,
                 num_kv_heads=num_kv_heads,
                 rope_scaling=rope_scaling,
+                shift_input_embeds=getattr(spec_cfg, "shift_input_embeds", False),
             )
         elif draft_type == "dflash":
             from lumenrl.models.dflash import DFlashModel
@@ -450,6 +464,18 @@ class SpecDistillTrainer:
             raise ValueError(
                 f"Unknown draft_type: {draft_type!r}. Use 'eagle3' or 'dflash'."
             )
+
+        if draft_type == "eagle3" and getattr(draft_cfg, "from_scratch", False):
+            if self._norm_weight is not None and hasattr(self._draft_model, "out_norm"):
+                with torch.no_grad():
+                    self._draft_model.out_norm.weight.copy_(self._norm_weight)
+                logger.info(
+                    "[rank %d] Initialized Eagle3 out_norm from teacher final norm "
+                    "(mean=%.4f std=%.4f) — breaks cold-start by matching logit scale",
+                    self._rank,
+                    self._norm_weight.float().mean().item(),
+                    self._norm_weight.float().std().item(),
+                )
 
         resume_from = getattr(draft_cfg, "resume_from", None)
         if resume_from and not getattr(draft_cfg, "from_scratch", False):
@@ -609,6 +635,7 @@ class SpecDistillTrainer:
         eval_cfg = self.config.eval
         if eval_cfg.enabled:
             self._build_eval_cache(num_samples=eval_cfg.num_samples)
+            self._build_eval_teacher_cache()
 
         if not self.callbacks:
             self.callbacks.append(
@@ -696,6 +723,9 @@ class SpecDistillTrainer:
                 if extra and isinstance(extra, dict):
                     atom_config.update(extra)
 
+            spec_cfg = getattr(self.config.algorithm, "spec_distill", None)
+            capture_mode = getattr(spec_cfg, "capture_mode", "postnorm") if spec_cfg else "postnorm"
+
             self._teacher_engine = AtomTeacherEngine(
                 model_name=teacher_name,
                 tensor_parallel_size=teacher_cfg.tensor_parallel_size,
@@ -707,11 +737,13 @@ class SpecDistillTrainer:
                 max_batch_size=max_bs,
                 max_seq_len=max_seq,
                 local_device=self._device,
+                capture_mode=capture_mode,
             )
             self._teacher_engine.start()
             self._lm_head_weight = self._teacher_engine.get_lm_head_weight()
             self._embed_weight = self._teacher_engine.get_embed_weight()
             self._norm_weight, self._norm_eps = self._teacher_engine.get_norm_weight()
+            self._capture_mode = capture_mode
         else:
             self._teacher_engine = None
             self._lm_head_weight = None
@@ -855,6 +887,7 @@ class SpecDistillTrainer:
                 max_seq_len=int(self.config.policy.max_total_sequence_length),
                 local_device=self._device,
                 aux_layer_ids=list(aux_override) if aux_override else None,
+                separate_last_hidden=getattr(spec_cfg, "separate_last_hidden", False) if spec_cfg else False,
             )
             self._teacher_engine.start()
             self._lm_head_weight = self._teacher_engine.get_lm_head_weight()
@@ -979,9 +1012,43 @@ class SpecDistillTrainer:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Teacher forward via vLLM+ATOM engine (rank 0 only, then broadcast)."""
-        rank0_data = self._teacher_inference_rank0(input_ids, attention_mask)
-        return self._teacher_broadcast(rank0_data, input_ids)
+        """Teacher forward via vLLM+ATOM engine (rank 0 only, then broadcast).
+
+        When ``generate_mode == "generate"``, the teacher generates responses
+        from prompt-only input and captures hidden states on the full sequence.
+        """
+        teacher_cfg = self.config.algorithm.teacher
+        generate_mode = getattr(teacher_cfg, "generate_mode", "prefill")
+
+        if generate_mode == "generate":
+            rank0_data = self._teacher_generate_and_extract_rank0(
+                input_ids, attention_mask,
+            )
+            result = self._teacher_broadcast(rank0_data, input_ids)
+            if self._rank == 0 and rank0_data is not None:
+                gen_ids = rank0_data["input_ids"]
+            else:
+                gen_ids = None
+            if self._is_distributed:
+                if self._rank == 0:
+                    gen_ids = gen_ids.to(self._device)
+                    gen_shape = torch.tensor(
+                        list(gen_ids.shape), dtype=torch.long, device=self._device,
+                    )
+                else:
+                    gen_shape = torch.zeros(2, dtype=torch.long, device=self._device)
+                torch.distributed.broadcast(gen_shape, src=0)
+                if self._rank != 0:
+                    gen_ids = torch.zeros(
+                        gen_shape[0].item(), gen_shape[1].item(),
+                        dtype=torch.long, device=self._device,
+                    )
+                torch.distributed.broadcast(gen_ids, src=0)
+            result["input_ids"] = gen_ids
+            return result
+        else:
+            rank0_data = self._teacher_inference_rank0(input_ids, attention_mask)
+            return self._teacher_broadcast(rank0_data, input_ids)
 
     def _broadcast_batch_info(
         self, input_ids: torch.Tensor | None,
@@ -1190,6 +1257,9 @@ class SpecDistillTrainer:
             logger.info("[rank %d] LR scheduler advanced to step %d (lr=%.2e)",
                         self._rank, resumed_step, self._optimizer.get_learning_rate())
 
+        # Preserve optimizer momentum on resume — resetting causes accuracy
+        # regression (40% → 8%) that takes thousands of steps to recover.
+
         logger.info("[rank %d] Resumed training from step %d", self._rank, resumed_step)
 
     # ------------------------------------------------------------------
@@ -1309,29 +1379,23 @@ class SpecDistillTrainer:
             self._rank, len(cache), start_idx, ds_len - 1,
         )
 
-    def run_validation(self) -> dict[str, float]:
-        """Run eval on cached samples. Returns eval/* metrics.
+    def _build_eval_teacher_cache(self) -> None:
+        """Pre-compute teacher outputs for all eval micro-batches at startup.
 
-        Must run on all ranks (teacher forward + FSDP need collective ops).
+        Stores results on CPU so ``run_validation`` never touches the teacher
+        engine — avoiding the concurrent-request crash with the async prefetcher.
         """
         if not hasattr(self, "_eval_cache") or not self._eval_cache:
-            return {}
+            self._eval_teacher_cache: list[dict[str, torch.Tensor]] = []
+            return
 
-        spec_cfg = self.config.algorithm.spec_distill
-        draft_dtype = next(self._draft_model.parameters()).dtype
         eval_cfg = self.config.eval
         mb_size = eval_cfg.micro_batch_size
-
-        self._draft_model.eval()
-
-        all_losses: list[list[float]] = []
-        all_accs: list[list[float]] = []
-
-        # Batch eval samples
         all_ids = [c[0] for c in self._eval_cache]
         all_masks = [c[1] for c in self._eval_cache]
         all_lm = [c[2] for c in self._eval_cache]
 
+        cache: list[dict[str, torch.Tensor]] = []
         for mb_start in range(0, len(all_ids), mb_size):
             mb_end = min(mb_start + mb_size, len(all_ids))
             mb_ids_list = all_ids[mb_start:mb_end]
@@ -1352,16 +1416,54 @@ class SpecDistillTrainer:
                 padded_masks.append(mask)
                 padded_lm.append(lm)
 
-            input_ids = torch.cat(padded_ids, dim=0).to(self._device)
-            attention_mask = torch.cat(padded_masks, dim=0).to(self._device)
-            eval_loss_mask = torch.cat(padded_lm, dim=0).to(self._device)
+            input_ids = torch.cat(padded_ids, dim=0)
+            attention_mask = torch.cat(padded_masks, dim=0)
+            eval_loss_mask = torch.cat(padded_lm, dim=0)
 
-            teacher_data = self._teacher_forward(input_ids, attention_mask)
+            teacher_data = self._teacher_forward(
+                input_ids.to(self._device), attention_mask.to(self._device),
+            )
 
+            cache.append({
+                "hidden_states": teacher_data["hidden_states"].cpu(),
+                "input_ids": teacher_data["input_ids"].cpu(),
+                "last_hidden_states": teacher_data.get("last_hidden_states", torch.tensor([])).cpu(),
+                "attention_mask": attention_mask,
+                "loss_mask": eval_loss_mask,
+            })
+            del teacher_data
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        self._eval_teacher_cache = cache
+        logger.info(
+            "[rank %d] Eval teacher cache built: %d micro-batches pre-computed on CPU",
+            self._rank, len(cache),
+        )
+
+    def run_validation(self) -> dict[str, float]:
+        """Run eval on cached samples. Returns eval/* metrics.
+
+        Uses pre-cached teacher outputs (built at startup) so this never
+        touches the teacher engine — safe to run during async prefetch.
+        """
+        if not hasattr(self, "_eval_teacher_cache") or not self._eval_teacher_cache:
+            return {}
+
+        spec_cfg = self.config.algorithm.spec_distill
+        draft_dtype = next(self._draft_model.parameters()).dtype
+
+        self._draft_model.eval()
+
+        all_losses: list[list[float]] = []
+        all_accs: list[list[float]] = []
+
+        for cached in self._eval_teacher_cache:
             with torch.no_grad():
-                aux_hidden = teacher_data["hidden_states"].to(device=self._device, dtype=draft_dtype)
-                t_ids = teacher_data["input_ids"].to(self._device)
-                t_ids = torch.cat([t_ids[:, 1:], torch.zeros_like(t_ids[:, :1])], dim=1)
+                aux_hidden = cached["hidden_states"].to(device=self._device, dtype=draft_dtype)
+                t_ids = cached["input_ids"].to(self._device)
+                if spec_cfg.shift_input_embeds:
+                    t_ids = t_ids.roll(-1, 1)
                 lm_head_w = self._lm_head_weight.to(device=self._device, dtype=draft_dtype)
                 embed_w = self._embed_weight.to(device=self._device, dtype=draft_dtype)
                 T_teacher = aux_hidden.shape[1]
@@ -1370,28 +1472,34 @@ class SpecDistillTrainer:
                     token_embeds = token_embeds[:, :T_teacher]
                 if t_ids.shape[1] != T_teacher:
                     t_ids = t_ids[:, :T_teacher]
-                loss_mask = eval_loss_mask
+                loss_mask = cached["loss_mask"].to(self._device)
                 if loss_mask.shape[1] != T_teacher:
                     loss_mask = loss_mask[:, :T_teacher]
 
-                target_hs = teacher_data.get("last_hidden_states")
-                if target_hs is not None:
+                target_hs = cached["last_hidden_states"]
+                if target_hs is not None and target_hs.numel() > 0:
                     target_hs = target_hs.to(device=self._device, dtype=draft_dtype)
-                    target_hs = torch.cat([target_hs[:, 1:], torch.zeros_like(target_hs[:, :1])], dim=1)
                     nan_mask = torch.isnan(target_hs).any(dim=-1)
                     if nan_mask.any():
                         loss_mask = loss_mask.clone()
                         loss_mask[:, :nan_mask.shape[1]][nan_mask] = 0
                         target_hs = target_hs.nan_to_num_(0.0)
-                    if self._norm_weight is not None:
-                        nw = self._norm_weight.to(device=self._device, dtype=draft_dtype)
-                        ths_f32 = target_hs.float()
-                        variance = ths_f32.pow(2).mean(-1, keepdim=True)
-                        target_hs = (ths_f32 * torch.rsqrt(variance + self._norm_eps)).to(draft_dtype) * nw
+                    if spec_cfg.separate_last_hidden and self._norm_weight is not None:
+                        variance = target_hs.float().pow(2).mean(-1, keepdim=True)
+                        target_hs = (
+                            target_hs.float()
+                            * torch.rsqrt(variance + self._norm_eps)
+                        ).to(draft_dtype) * self._norm_weight.to(
+                            device=self._device, dtype=draft_dtype
+                        )
+                else:
+                    target_hs = None
 
-                eval_attn_mask = attention_mask.to(self._device)
+                eval_attn_mask = cached["attention_mask"].to(self._device)
                 if eval_attn_mask.shape[1] != T_teacher:
                     eval_attn_mask = eval_attn_mask[:, :T_teacher]
+                if spec_cfg.shift_input_embeds:
+                    eval_attn_mask = eval_attn_mask.roll(-1, 1)
                 result = self._draft_model(
                     token_embeds=token_embeds,
                     aux_hidden_states=aux_hidden,
@@ -1409,7 +1517,7 @@ class SpecDistillTrainer:
             all_losses.append(step_losses)
             all_accs.append(step_accs)
 
-            del teacher_data, result
+            del result
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -1492,7 +1600,10 @@ class SpecDistillTrainer:
                     lm = lm[:len(ids)]
                 elif len(lm) < len(ids):
                     lm = torch.cat([lm, torch.zeros(len(ids) - len(lm), dtype=torch.long)])
-                if lm.sum() < 1:
+                gen_mode = getattr(
+                    self.config.algorithm.teacher, "generate_mode", "prefill"
+                )
+                if lm.sum() < 1 and gen_mode != "generate":
                     replacement = (idx + bs) % ds_len
                     for _ in range(ds_len):
                         r_item = self._preprocessed[replacement]
@@ -1646,9 +1757,60 @@ class SpecDistillTrainer:
 
         Returns 3 aux hidden states [B,T,3*D], token_embeds [B,T,D],
         last_hidden_states [B,T,D] — same format as vLLM path.
+
+        When ``generate_mode == "generate"``, the teacher generates responses
+        from prompt-only input and captures hidden states during generation.
         """
-        rank0_data = self._teacher_inference_rank0(input_ids, attention_mask)
-        return self._teacher_broadcast(rank0_data, input_ids)
+        teacher_cfg = self.config.algorithm.teacher
+        generate_mode = getattr(teacher_cfg, "generate_mode", "prefill")
+
+        if generate_mode == "generate":
+            rank0_data = self._teacher_generate_and_extract_rank0(
+                input_ids, attention_mask,
+            )
+            result = self._teacher_broadcast(rank0_data, input_ids)
+            if self._rank == 0 and rank0_data is not None:
+                gen_ids = rank0_data["input_ids"]
+            else:
+                gen_ids = None
+            if self._is_distributed:
+                if self._rank == 0:
+                    gen_ids = gen_ids.to(self._device)
+                    gen_shape = torch.tensor(
+                        list(gen_ids.shape), dtype=torch.long, device=self._device,
+                    )
+                else:
+                    gen_shape = torch.zeros(2, dtype=torch.long, device=self._device)
+                torch.distributed.broadcast(gen_shape, src=0)
+                if self._rank != 0:
+                    gen_ids = torch.zeros(
+                        gen_shape[0].item(), gen_shape[1].item(),
+                        dtype=torch.long, device=self._device,
+                    )
+                torch.distributed.broadcast(gen_ids, src=0)
+            result["input_ids"] = gen_ids
+            return result
+        else:
+            rank0_data = self._teacher_inference_rank0(input_ids, attention_mask)
+            return self._teacher_broadcast(rank0_data, input_ids)
+
+    def _teacher_generate_and_extract_rank0(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        recv_device: torch.device | None = None,
+    ) -> dict[str, torch.Tensor] | None:
+        """Generate + extract hidden states on rank 0 (generate mode)."""
+        if self._rank != 0:
+            return None
+        teacher_cfg = self.config.algorithm.teacher
+        max_tokens = getattr(teacher_cfg, "generate_max_tokens", 2048)
+        temperature = getattr(teacher_cfg, "generate_temperature", 0.0)
+        return self._teacher_engine.generate_and_extract_hidden_states(
+            input_ids, attention_mask,
+            max_tokens=max_tokens, temperature=temperature,
+            recv_device=recv_device,
+        )
 
     def _teacher_forward_hf(
         self,
@@ -1762,9 +1924,9 @@ class SpecDistillTrainer:
                 logger.info("[rank %d] step=%d eagle3-probe %s", self._rank, step, tag)
         _mem("enter")
         draft_dtype = next(self._draft_model.parameters()).dtype
-        aux_hidden = teacher_data["hidden_states"].to(device=self._device, dtype=draft_dtype)  # [B, T, 3*H]
-        input_ids = teacher_data["input_ids"].to(self._device)
-        input_ids = torch.cat([input_ids[:, 1:], torch.zeros_like(input_ids[:, :1])], dim=1)
+        aux_hidden = teacher_data["hidden_states"].to(device=self._device, dtype=draft_dtype)
+        raw_input_ids = teacher_data["input_ids"].to(self._device)
+        input_ids = torch.cat([raw_input_ids[:, 1:], torch.zeros_like(raw_input_ids[:, :1])], dim=1)
         _mem(f"inputs-on-gpu (aux={tuple(aux_hidden.shape)} ids={tuple(input_ids.shape)})")
 
         if not hasattr(self, "_lm_head_w_gpu") or self._lm_head_w_gpu is None:
@@ -1774,49 +1936,86 @@ class SpecDistillTrainer:
             _mem("after-lazy-lm_head-materialize")
         lm_head_w = self._lm_head_w_gpu
         embed_w = self._embed_w_gpu
-        token_embeds = torch.nn.functional.embedding(input_ids, embed_w)
+        spec_cfg = self.config.algorithm.spec_distill
+        if spec_cfg.shift_input_embeds:
+            token_embeds = torch.nn.functional.embedding(raw_input_ids.roll(-1, 1), embed_w)
+        else:
+            token_embeds = torch.nn.functional.embedding(input_ids, embed_w)
         _mem("after-embed")
 
         if loss_mask is not None:
             loss_mask = loss_mask.to(self._device)
         else:
             loss_mask = attention_mask.to(self._device)
-        spec_cfg = self.config.algorithm.spec_distill
         target_hs = teacher_data.get("last_hidden_states")
 
-        aux_nan = torch.isnan(aux_hidden).any(dim=-1)  # [B, T]
-        target_nan = torch.zeros_like(aux_nan)
+        aux_bad = (torch.isnan(aux_hidden) | torch.isinf(aux_hidden)).any(dim=-1)
+        target_bad = torch.zeros_like(aux_bad)
         if target_hs is not None:
             target_hs = target_hs.to(device=self._device, dtype=draft_dtype)
-            target_hs = torch.cat([target_hs[:, 1:], torch.zeros_like(target_hs[:, :1])], dim=1)
-            target_nan = torch.isnan(target_hs).any(dim=-1)
+            target_bad = (torch.isnan(target_hs) | torch.isinf(target_hs)).any(dim=-1)
 
-
-        nan_mask = aux_nan | target_nan
-        if nan_mask.any():
-            nan_count = nan_mask.sum().item()
-            aux_only = (aux_nan & ~target_nan).sum().item()
-            tgt_only = (target_nan & ~aux_nan).sum().item()
-            both = (aux_nan & target_nan).sum().item()
+        bad_mask = aux_bad | target_bad
+        if bad_mask.any():
+            bad_count = bad_mask.sum().item()
+            aux_only = (aux_bad & ~target_bad).sum().item()
+            tgt_only = (target_bad & ~aux_bad).sum().item()
+            both = (aux_bad & target_bad).sum().item()
             loss_mask = loss_mask.clone()
-            loss_mask[:, :nan_mask.shape[1]][nan_mask] = 0
-            aux_hidden = aux_hidden.nan_to_num_(0.0)
+            loss_mask[:, :bad_mask.shape[1]][bad_mask] = 0
+            aux_hidden = torch.where(
+                torch.isfinite(aux_hidden), aux_hidden,
+                torch.zeros_like(aux_hidden),
+            )
             if target_hs is not None:
-                target_hs = target_hs.nan_to_num_(0.0)
+                target_hs = torch.where(
+                    torch.isfinite(target_hs), target_hs,
+                    torch.zeros_like(target_hs),
+                )
             logger.warning(
-                "Masked %d teacher NaN positions (aux_only=%d tgt_only=%d both=%d)",
-                nan_count, aux_only, tgt_only, both,
+                "Masked %d/%d NaN/Inf (aux=%d tgt=%d both=%d) lm_remain=%d/%d",
+                bad_count, bad_mask.numel(), aux_only, tgt_only, both,
+                loss_mask.sum().item(), loss_mask.numel(),
             )
 
-        if target_hs is not None and self._norm_weight is not None:
-            nw = self._norm_weight.to(device=self._device, dtype=draft_dtype)
-            ths_f32 = target_hs.float()
-            variance = ths_f32.pow(2).mean(-1, keepdim=True)
-            target_hs = (ths_f32 * torch.rsqrt(variance + self._norm_eps)).to(draft_dtype) * nw
+        # ATOM captures post-norm hidden states (applies RMSNorm in its model).
+        # vLLM captures pre-norm hidden states (raw x + residual from
+        # _maybe_add_hidden_state). When separate_last_hidden is True (vLLM
+        # path), apply the teacher's final RMSNorm so teacher logits match
+        # NVIDIA's post-norm convention: lm_head(norm(last_hidden)).
+        if (
+            target_hs is not None
+            and spec_cfg.separate_last_hidden
+            and self._norm_weight is not None
+        ):
+            variance = target_hs.float().pow(2).mean(-1, keepdim=True)
+            target_hs = (
+                target_hs.float()
+                * torch.rsqrt(variance + self._norm_eps)
+            ).to(draft_dtype) * self._norm_weight.to(
+                device=self._device, dtype=draft_dtype
+            )
 
-
+        if step % 100 == 0 and self._rank == 0:
+            H = aux_hidden.shape[-1] // 3
+            a0, a1, a2 = aux_hidden[..., :H], aux_hidden[..., H:2*H], aux_hidden[..., 2*H:]
+            logger.info(
+                "diag step=%d aux_hs(raw): layer0 std=%.4e max_abs=%.4e | "
+                "layer1 std=%.4e max_abs=%.4e | layer2 std=%.4e max_abs=%.4e | "
+                "has_inf=%s has_nan=%s | token_embeds std=%.4f  target_hs std=%.4f",
+                step,
+                a0.double().std().item(), a0.float().abs().max().item(),
+                a1.double().std().item(), a1.float().abs().max().item(),
+                a2.double().std().item(), a2.float().abs().max().item(),
+                aux_hidden.isinf().any().item(), aux_hidden.isnan().any().item(),
+                token_embeds.float().std().item(),
+                target_hs.float().std().item() if target_hs is not None else -1.0,
+            )
 
         _mem("before-forward")
+        eagle_attn_mask = attention_mask.to(self._device)
+        if spec_cfg.shift_input_embeds:
+            eagle_attn_mask = eagle_attn_mask.roll(-1, 1)
         result = self._draft_model(
             token_embeds=token_embeds,
             aux_hidden_states=aux_hidden,
@@ -1826,7 +2025,7 @@ class SpecDistillTrainer:
             target_ids=input_ids,
             loss_type=spec_cfg.loss_type,
             target_hidden_states=target_hs,
-            attention_mask=attention_mask.to(self._device),
+            attention_mask=eagle_attn_mask,
         )
         _mem("after-forward")
 

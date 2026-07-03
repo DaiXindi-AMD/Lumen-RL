@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# GPT-OSS-120B Eagle3 Draft Model Distillation (vLLM + Mooncake TCP) — MI350
+# GPT-OSS-120B Eagle3 Draft Model Distillation (ATOM + Mooncake TCP) — MI355
 #
 # Single-pass training on combined UltraChat + Magpie dataset (~503K samples).
-# Data must be prepared first via make_dataset.py (see run_docker.sh Step 0).
+# Data must be prepared first via lumenrl.data.make_dataset (see run_docker.sh Step 0).
 #
-# GPU split (8x MI350):
+# GPU split (8x MI355):
 #   GPUs 0-3: torchrun FSDP2 draft model training (BF16, LumenRL + aiter)
-#   GPUs 4-7: vLLM teacher inference (TP=4, native MXFP4 MoE)
+#   GPUs 4-7: ATOM teacher inference (TP=4, native MXFP4 MoE)
 #
 # Usage:
 #   bash examples/GPT_OSS_120b_MI355_ATOM/run_gpt_oss_120b.sh
@@ -26,7 +26,7 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-EXP_NAME="gpt-oss-120b-eagle3-mi350"
+EXP_NAME="gpt-oss-120b-eagle3-mi355"
 OUTPUT_DIR="${REPO_ROOT}/output/GPT_OSS_120b_SDDD/LumenRL"
 LOG_FILE="${OUTPUT_DIR}/${EXP_NAME}.log"
 
@@ -39,7 +39,7 @@ MODEL_PATH="${MODEL_PATH:-/dev/shm/gpt-oss-120b}"
 if [ "${SMOKE_TEST}" = true ]; then
     CKPT_DIR="${CKPT_DIR:-/dev/shm/checkpoints/gpt_oss_120b_smoke_test}"
     CONFIG="${SCRIPT_DIR}/configs/smoke_test.yaml"
-    echo ">>> SMOKE TEST: 5-step Eagle3 validation (vLLM+Mooncake TCP, gpt-oss-120b)"
+    echo ">>> SMOKE TEST: 5-step Eagle3 validation (ATOM+Mooncake TCP, gpt-oss-120b)"
 else
     CKPT_DIR="${CKPT_DIR:-/dev/shm/checkpoints/gpt_oss_120b_eagle3}"
     CONFIG="${SCRIPT_DIR}/configs/train.yaml"
@@ -57,16 +57,20 @@ export MOONCAKE_LOG_LEVEL="${MOONCAKE_LOG_LEVEL:-FATAL}"
 
 mkdir -p "${OUTPUT_DIR}" "${CKPT_DIR}"
 
+# Clear pyc caches to pick up volume-mounted code changes
+find /root/lumenrl -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
 cleanup_orphans() {
     pkill -9 -f "VLLM::Worker" 2>/dev/null || true
     pkill -9 -f "EngineCore"  2>/dev/null || true
+    pkill -9 -f "AsyncLLMEngine" 2>/dev/null || true
     pkill -9 -f "mooncake_master" 2>/dev/null || true
 }
 trap cleanup_orphans EXIT
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  GPT-OSS-120B Eagle3 Draft Model Distillation (vLLM) — MI350"
-echo "  Teacher:     ${MODEL_PATH} (vLLM 0.11, GPUs 4-7, TP=4, native MXFP4)"
+echo "  GPT-OSS-120B Eagle3 Draft Model Distillation (ATOM) — MI355"
+echo "  Teacher:     ${MODEL_PATH} (ATOM, GPUs 4-7, TP=4, native MXFP4)"
 echo "  Draft:       Eagle3 (1 Transformer block, BF16)"
 echo "  Train GPUs:  ${TRAIN_GPUS} (${NUM_TRAIN_GPUS} GPUs, FSDP2+aiter)"
 echo "  Transfer:    Mooncake TCP"
@@ -99,9 +103,9 @@ if [ ${EXIT_CODE} -eq 0 ] && grep -qE \
 fi
 
 if [ ${EXIT_CODE} -eq 0 ]; then
-    echo ">>> GPT-OSS-120B Eagle3 distillation (vLLM, MI350) completed successfully."
+    echo ">>> GPT-OSS-120B Eagle3 distillation (ATOM, MI355) completed successfully."
 else
-    echo ">>> GPT-OSS-120B Eagle3 distillation (vLLM, MI350) failed with exit code ${EXIT_CODE}." >&2
+    echo ">>> GPT-OSS-120B Eagle3 distillation (ATOM, MI355) failed with exit code ${EXIT_CODE}." >&2
 fi
 echo ">>> Log: ${LOG_FILE}"
 exit ${EXIT_CODE}

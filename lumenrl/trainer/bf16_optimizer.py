@@ -225,6 +225,29 @@ class BF16Optimizer:
             for mp, p in zip(self.fp32_params, self.model_params):
                 mp.data.copy_(p.data.float())
 
+    def reset_optimizer_momentum(self) -> None:
+        """Reset Adam exp_avg and exp_avg_sq to zero on resume.
+
+        After a checkpoint resume the ATOM teacher restarts with slightly
+        different hidden states (MoE routing non-determinism, MXFP4
+        quantization).  The stale momentum causes the model to drift even
+        with a low LR.  Resetting lets Adam re-adapt from scratch while
+        keeping the learned weights.
+        """
+        reset_count = 0
+        for state in self.optimizer.state.values():
+            if "exp_avg" in state:
+                state["exp_avg"].zero_()
+                reset_count += 1
+            if "exp_avg_sq" in state:
+                state["exp_avg_sq"].zero_()
+            if "step" in state:
+                state["step"] = torch.tensor(0, dtype=state["step"].dtype)
+        logger.info(
+            "BF16Optimizer: reset optimizer momentum for %d params (exp_avg, exp_avg_sq, step → 0)",
+            reset_count,
+        )
+
     def get_learning_rate(self) -> float:
         return self.optimizer.param_groups[0]["lr"]
 

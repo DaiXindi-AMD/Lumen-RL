@@ -146,25 +146,38 @@ class AsyncPutManager:
         with self._flight_lock:
             self._in_flight[owner_buffer_ptr] = future
 
-    def _do_put(self, keys, buffer_ptrs, sizes, wait_event=None, device_index=None):
+    def _do_put(self, keys, buffer_ptrs, sizes, wait_event=None, device_index=None,
+                _max_retries=3, _retry_delay=0.5):
         if wait_event is not None:
             if device_index is not None:
                 torch.cuda.set_device(device_index)
             wait_event.synchronize()
-        with self._put_lock:
-            if self._replicate_config is not None:
-                results = self._store.batch_put_from(
-                    keys, buffer_ptrs, sizes, config=self._replicate_config)
-            else:
-                results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
-        failures = [(k, r) for k, r in zip(keys, results) if r != 0]
-        if failures:
+        for attempt in range(_max_retries):
+            with self._put_lock:
+                if self._replicate_config is not None:
+                    results = self._store.batch_put_from(
+                        keys, buffer_ptrs, sizes, config=self._replicate_config)
+                else:
+                    results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
+            failures = [(k, r) for k, r in zip(keys, results) if r != 0]
+            if not failures:
+                if attempt > 0:
+                    logger.info("batch_put_from succeeded on attempt %d for %s",
+                                attempt + 1, keys[0])
+                return
             try:
                 self._store.batch_remove(keys, force=True)
             except Exception:
                 pass
-            detail = ", ".join(f"{k} (code={r})" for k, r in failures)
-            raise RuntimeError(f"async batch_put_from failed: {detail}")
+            if attempt < _max_retries - 1:
+                detail = ", ".join(f"{k} (code={r})" for k, r in failures)
+                logger.warning("batch_put_from attempt %d/%d failed: %s; retrying in %.1fs",
+                               attempt + 1, _max_retries, detail, _retry_delay)
+                time.sleep(_retry_delay)
+                _retry_delay *= 2
+            else:
+                detail = ", ".join(f"{k} (code={r})" for k, r in failures)
+                raise RuntimeError(f"async batch_put_from failed after {_max_retries} attempts: {detail}")
 
     def drain(self) -> None:
         with self._flight_lock:
@@ -466,19 +479,32 @@ class EagleMooncakeStore:
         self._async_put_manager.drain()
         self._async_put_manager.check_last_error()
 
-    def _do_sync_batch_put(self, keys, buffer_ptrs, sizes):
-        if self._replicate_config is not None:
-            results = self._store.batch_put_from(keys, buffer_ptrs, sizes, config=self._replicate_config)
-        else:
-            results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
-        failures = [(k, r) for k, r in zip(keys, results) if r != 0]
-        if failures:
+    def _do_sync_batch_put(self, keys, buffer_ptrs, sizes,
+                           _max_retries=3, _retry_delay=0.5):
+        for attempt in range(_max_retries):
+            if self._replicate_config is not None:
+                results = self._store.batch_put_from(keys, buffer_ptrs, sizes, config=self._replicate_config)
+            else:
+                results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
+            failures = [(k, r) for k, r in zip(keys, results) if r != 0]
+            if not failures:
+                if attempt > 0:
+                    logger.info("batch_put_from succeeded on attempt %d for %s",
+                                attempt + 1, keys[0])
+                return
             try:
                 self._store.batch_remove(keys, force=True)
             except Exception:
                 pass
-            detail = ", ".join(f"{k} (code={r})" for k, r in failures)
-            raise RuntimeError(f"batch_put_from failed: {detail}")
+            if attempt < _max_retries - 1:
+                detail = ", ".join(f"{k} (code={r})" for k, r in failures)
+                logger.warning("batch_put_from attempt %d/%d failed: %s; retrying in %.1fs",
+                               attempt + 1, _max_retries, detail, _retry_delay)
+                time.sleep(_retry_delay)
+                _retry_delay *= 2
+            else:
+                detail = ", ".join(f"{k} (code={r})" for k, r in failures)
+                raise RuntimeError(f"batch_put_from failed after {_max_retries} attempts: {detail}")
 
     @staticmethod
     def _stage_tensors_into_buffer(buf, tensors):
@@ -585,7 +611,10 @@ class EagleMooncakeStore:
             nbytes = numel * _DTYPE_ELEMENT_SIZES[dtype]
             c_arr = (ctypes.c_byte * nbytes).from_address(buf.ptr())
             host_t = torch.frombuffer(c_arr, dtype=dtype, count=numel).reshape(shape)
-            tensor_map[name] = host_t.to(device)
+            if device is not None and device.type != "cpu":
+                tensor_map[name] = host_t.to(device)
+            else:
+                tensor_map[name] = host_t.clone()
             if name == "input_ids":
                 tensor_map["input_ids_cpu"] = host_t.clone()
         return tensor_map

@@ -1,0 +1,153 @@
+{
+  "backend": "atom",
+  "target_model": "/dev/shm/gpt-oss-120b",
+  "draft_model": "/home/danyzhan/gpt_oss_120b_eagle3_HF",
+  "checkpoint_step": "nvidia_official",
+  "spec_length": 3,
+  "benchmarks": {
+    "mtbench_coding": {
+      "benchmark": "mtbench_coding",
+      "num_samples": 10,
+      "accept_length": 1.592,
+      "acceptance_rate": 19.7,
+      "total_output_tokens": 10861,
+      "throughput_tps": 307.8,
+      "latency_s": 35.3,
+      "num_draft_tokens": 20454,
+      "num_accepted": 4033,
+      "distribution": {
+        "0": 4343,
+        "1": 1392,
+        "2": 608,
+        "3": 475
+      },
+      "errors": 0
+    },
+    "mtbench_extraction": {
+      "benchmark": "mtbench_extraction",
+      "num_samples": 10,
+      "accept_length": 1.533,
+      "acceptance_rate": 17.8,
+      "total_output_tokens": 4138,
+      "throughput_tps": 252.0,
+      "latency_s": 16.4,
+      "num_draft_tokens": 8076,
+      "num_accepted": 1436,
+      "distribution": {
+        "0": 1724,
+        "1": 635,
+        "2": 198,
+        "3": 135
+      },
+      "errors": 0
+    },
+    "mtbench_humanities": {
+      "benchmark": "mtbench_humanities",
+      "num_samples": 10,
+      "accept_length": 1.351,
+      "acceptance_rate": 11.7,
+      "total_output_tokens": 10760,
+      "throughput_tps": 250.7,
+      "latency_s": 42.9,
+      "num_draft_tokens": 23868,
+      "num_accepted": 2794,
+      "distribution": {
+        "0": 5991,
+        "1": 1345,
+        "2": 411,
+        "3": 209
+      },
+      "errors": 0
+    },
+    "mtbench_math": {
+      "benchmark": "mtbench_math",
+      "num_samples": 10,
+      "accept_length": 2.242,
+      "acceptance_rate": 41.4,
+      "total_output_tokens": 4716,
+      "throughput_tps": 354.7,
+      "latency_s": 13.3,
+      "num_draft_tokens": 6297,
+      "num_accepted": 2607,
+      "distribution": {
+        "0": 803,
+        "1": 465,
+        "2": 351,
+        "3": 480
+      },
+      "errors": 0
+    },
+    "mtbench_reasoning": {
+      "benchmark": "mtbench_reasoning",
+      "num_samples": 10,
+      "accept_length": 1.605,
+      "acceptance_rate": 20.2,
+      "total_output_tokens": 3821,
+      "throughput_tps": 258.6,
+      "latency_s": 14.8,
+      "num_draft_tokens": 7122,
+      "num_accepted": 1437,
+      "distribution": {
+        "0": 1468,
+        "1": 543,
+        "2": 195,
+        "3": 168
+      },
+      "errors": 0
+    },
+    "mtbench_roleplay": {
+      "benchmark": "mtbench_roleplay",
+      "num_samples": 10,
+      "accept_length": 1.401,
+      "acceptance_rate": 13.4,
+      "total_output_tokens": 7139,
+      "throughput_tps": 253.9,
+      "latency_s": 28.1,
+      "num_draft_tokens": 15261,
+      "num_accepted": 2042,
+      "distribution": {
+        "0": 3689,
+        "1": 923,
+        "2": 306,
+        "3": 169
+      },
+      "errors": 0
+    },
+    "mtbench_stem": {
+      "benchmark": "mtbench_stem",
+      "num_samples": 10,
+      "accept_length": 1.474,
+      "acceptance_rate": 15.8,
+      "total_output_tokens": 9165,
+      "throughput_tps": 271.6,
+      "latency_s": 33.8,
+      "num_draft_tokens": 18627,
+      "num_accepted": 2946,
+      "distribution": {
+        "0": 4397,
+        "1": 1056,
+        "2": 378,
+        "3": 378
+      },
+      "errors": 0
+    },
+    "mtbench_writing": {
+      "benchmark": "mtbench_writing",
+      "num_samples": 10,
+      "accept_length": 1.768,
+      "acceptance_rate": 25.6,
+      "total_output_tokens": 5184,
+      "throughput_tps": 306.8,
+      "latency_s": 16.9,
+      "num_draft_tokens": 8781,
+      "num_accepted": 2247,
+      "distribution": {
+        "0": 1738,
+        "1": 511,
+        "2": 298,
+        "3": 380
+      },
+      "errors": 0
+    }
+  }
+}

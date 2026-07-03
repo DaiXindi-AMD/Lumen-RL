@@ -14,7 +14,7 @@
 #   eagle_self_logit_distillation: true → loss_type: forward_kl
 #
 # Data preparation (prompt-only, matching NVIDIA model card):
-#   python3 examples/GPT_OSS_120b_MI355_ATOM/make_dataset.py
+#   python3 -m lumenrl.data.make_dataset
 #   → /dev/shm/gpt_oss_120b_dataset/train.jsonl (~503K prompts)
 #
 # Disaggregated architecture (ATOM + Mooncake TCP):
@@ -44,8 +44,9 @@ policy:
   # Aligned with Model-Optimizer eagle3.yaml: learning_rate=1e-4
   learning_rate: 1e-4
   weight_decay: 0.0
-  max_grad_norm: 0.5
-  # warmup_steps=1000 / total_steps=15870 ≈ 0.063
+  # NVIDIA eagle3.yaml uses HF default max_grad_norm=1.0
+  max_grad_norm: 1.0
+  # warmup_steps=1000 / total_steps=15871 ≈ 0.063
   warmup_ratio: 0.063
   # Model-Optimizer default: lr_scheduler_type=linear
   lr_decay_style: linear
@@ -61,6 +62,8 @@ algorithm:
     # eagle_ttt_steps=3 in Model-Optimizer
     spec_length: 3
     aux_hidden_state_layer_ids: [1, 17, 32]
+    capture_mode: varnorm
+    shift_input_embeds: true
   teacher:
     model_name: /dev/shm/gpt-oss-120b
     inference_backend: atom
@@ -68,13 +71,17 @@ algorithm:
     gpu_ids: [4, 5, 6, 7]
     quantization: ""
     transport: mooncake
+    generate_mode: prefill
+    generate_max_tokens: 1024
+    generate_temperature: 0.0
     atom:
       enforce_eager: true
       trust_remote_code: true
       extra_args:
         kv_cache_dtype: fp8
-        max_num_batched_tokens: 40000
-        max_model_len: 2048
+        enable_prefix_caching: false
+        max_num_batched_tokens: 65536
+        max_model_len: 4096
         gpu_memory_utilization: 0.9
         level: 0
   draft:
@@ -115,16 +122,32 @@ quantization:
 dataset:
   chat_template: hf-generation
   last_turn_loss_only: false
-  min_loss_tokens: 0
+  min_loss_tokens: -1
   num_preprocess_workers: 16
   cache_dir: /dev/shm/lumenrl_cache
 
-# Combined prompts from make_dataset.py (~503K prompts in a single JSONL).
+# Dataset options (see make_dataset.py and generate_synthetic.py):
+#   Option A: raw prompts — make_dataset.py output, responses from original datasets
+#     dataset: /dev/shm/gpt_oss_120b_dataset/train.jsonl
+#   Option B (recommended, matches NVIDIA): synthetic data from base model
+#     python3 -m lumenrl.data.generate_synthetic \
+#       --data-path /dev/shm/gpt_oss_120b_dataset/train.jsonl \
+#       --output-path /dev/shm/gpt_oss_120b_dataset/train_synthetic.jsonl
+#     dataset: /dev/shm/gpt_oss_120b_dataset/train_synthetic.jsonl
+# Ref: NVIDIA gpt-oss-120b-Eagle3 model card — "only prompts from the datasets
+#   were used for data synthesis (the original responses were not used)"
+#   https://huggingface.co/nvidia/gpt-oss-120b-Eagle3-long-context
 reward:
   type: function
   function: math_reward
-  dataset: /dev/shm/gpt_oss_120b_dataset/train.jsonl
+  dataset: /dev/shm/gpt_oss_120b_dataset/train_with_responses.jsonl
   dataset_split: train
+
+eval:
+  enabled: false
+  interval: 1000
+  num_samples: 256
+  micro_batch_size: 8
 
 checkpointing:
   checkpoint_dir: /dev/shm/checkpoints/gpt_oss_120b_eagle3
@@ -136,7 +159,7 @@ logger:
   wandb_enabled: false
   log_interval: 1
 
-# ~508K prompts / global_bs=32 = 15,870 steps/epoch.
+# ~508K prompts / global_bs=32 = 15,871 steps/epoch.
 # Model-Optimizer default: num_train_epochs=1.
-num_training_steps: 15870
+num_training_steps: 15871
 seed: 42

@@ -1,0 +1,21 @@
+FROM rocm/atom:latest
+
+# Fix 1: embed_tokens -> embedding mapping for gpt-oss-120b
+# HF checkpoint uses model.embed_tokens.weight but ATOM model registers as model.embedding.weight
+RUN sed -i 's/    weights_mapping = {/    weights_mapping = {\n        "embed_tokens": "embedding",/' \
+    /app/ATOM/atom/models/gpt_oss.py
+
+# Fix 2: Add prepare_mtp_decode to AiterAttentionMetadataBuilder for Eagle3 on GQA models
+# Only MLA/GDN attention had this method; standard GQA attention needs it too for Eagle3 speculation
+COPY patches/aiter_attention_mtp_decode.py /tmp/patch_attn.py
+RUN python3 /tmp/patch_attn.py && rm /tmp/patch_attn.py
+
+# Fix 3: Add /debug/mtp_stats endpoint for acceptance rate monitoring
+COPY patches/add_mtp_stats_endpoint.py /tmp/patch_stats.py
+RUN python3 /tmp/patch_stats.py && rm /tmp/patch_stats.py
+
+# Copy benchmark scripts
+COPY bench_eagle3_atom.py /workspace/bench_eagle3_atom.py
+
+# Clear compile cache
+RUN rm -rf /root/.cache/atom/*
