@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -79,6 +80,35 @@ class LumenActorWorker(BaseWorker):
         self._engine.initialize()
         self._log.info("LumenActorWorker: initialized %s engine.", backend_key)
 
+    def _probe_forward_entropy(self, model_name: str) -> None:
+        """One-time sanity probe: entropy of the FSDP forward on a fixed clean
+        sequence. A correct base-model forward gives ~1-1.5; ~4+ indicates the
+        sharded forward is degenerate."""
+        try:
+            from transformers import AutoTokenizer
+            tk = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            base = tk("Question: What is 12*13? Answer: 12*13 = 156.", add_special_tokens=False)["input_ids"]
+
+            def _probe(ids, npad, tag):
+                real = list(ids)
+                seq = torch.tensor([[0] * npad + real], device=self._device)
+                am = torch.tensor([[0] * npad + [1] * len(real)], device=self._device)
+                data = {"input_ids": seq, "attention_mask": am,
+                        "position_ids": (am.long().cumsum(-1) - 1).clamp(min=0),
+                        "meta": {"calculate_entropy": True}}
+                with self._engine.eval_mode():
+                    out = self._engine.infer_batch(data)
+                em = am[:, 1:].float()
+                e = out["model_output"]["entropy"].float()
+                ent = float((e * em).sum() / em.sum().clamp(min=1))
+                self._log.info("PROBE_FWD %s entropy=%.3f (len=%d pad=%d)", tag, ent, len(real), npad)
+
+            _probe(base, 0, "short_nopad")
+            _probe(base, 512, "short_pad512")
+            _probe(base * 40, 512, "long_pad512")
+        except Exception as exc:
+            self._log.warning("PROBE_FWD failed: %s", exc)
+
     def _build_engine_config(
         self, backend: str, training_cfg: dict, policy: dict,
     ) -> dict[str, Any]:
@@ -87,12 +117,22 @@ class LumenActorWorker(BaseWorker):
             if not isinstance(fsdp_cfg, dict):
                 from dataclasses import asdict, is_dataclass
                 fsdp_cfg = asdict(fsdp_cfg) if is_dataclass(fsdp_cfg) else dict(vars(fsdp_cfg))
+            # Mixed-precision (verl-aligned): keep FP32 master weights so small
+            # Adam updates (lr ~1e-6 ~= 5e-7/step) accumulate. Storing the master
+            # in bf16 (eps ~8e-3) silently rounds these updates away -> the policy
+            # never changes (grad_norm looks normal but entropy/reward stay flat).
+            # Compute/all-gather in bf16 via FSDP2 MixedPrecisionPolicy.
+            compute_dtype = training_cfg.get("optimizer_dtype", "bf16")
             return {
                 "param_offload": fsdp_cfg.get("param_offload", False),
                 "optimizer_offload": fsdp_cfg.get("optimizer_offload", False),
                 "grad_offload": fsdp_cfg.get("grad_offload", False),
                 "reshard_after_forward": fsdp_cfg.get("reshard_after_forward", True),
-                "model_dtype": training_cfg.get("optimizer_dtype", "bf16"),
+                "model_dtype": "fp32",
+                "mixed_precision": {
+                    "param_dtype": compute_dtype,
+                    "reduce_dtype": "fp32",
+                },
                 "seed": int(policy.get("seed", 42)),
             }
         elif backend == "megatron":
@@ -132,24 +172,109 @@ class LumenActorWorker(BaseWorker):
         }
 
     def compute_log_probs(self, batch: DataProto) -> DataProto:
-        """Return per-token log probabilities for the policy."""
+        """Return per-token log-probs (and optionally entropy) for the policy.
+
+        Uses the SAME packed-varlen forward as the training step and as
+        ``RLTrainer._compute_log_probs_for_model`` (remove-padding + AITER
+        ``flash_attn_varlen_func``), which is the path validated to match verl
+        (``use_remove_padding=True``) to 1e-4 on entropy / log-prob / loss.
+
+        The earlier padded left-pad + SDPA forward here produced ~7x inflated
+        entropy: left-pad tokens were fed to attention with plain arange
+        positions, flattening the logit distribution. Packing removes all pad
+        tokens and gives every real token its exact varlen position.
+        """
         if self._engine is None:
             raise RuntimeError("init_model() must be called before compute_log_probs().")
         if "input_ids" not in batch.tensors:
             raise KeyError("batch must contain 'input_ids'")
 
-        data = {"input_ids": batch["input_ids"].to(self._device)}
-        if "attention_mask" in batch:
-            data["attention_mask"] = batch["attention_mask"].to(self._device)
+        from lumenrl.engine.training.packing import (
+            PackingContext,
+            pack_sequences,
+            packed_token_entropy,
+            packed_token_log_probs,
+            unpack_log_probs,
+        )
+
+        sequences = batch["input_ids"].to(self._device)
+        B, S = sequences.shape
+        am = batch.tensors.get("attention_mask")
+        if am is not None:
+            am = am.to(self._device)
+        else:
+            # No mask supplied -> treat every token as real. Only safe for
+            # already-unpadded input; the Ray controller always sends the mask.
+            am = torch.ones_like(sequences)
+
+        want_entropy = bool(batch.meta.get("calculate_entropy", False))
+        # verl divides logits by the sampling temperature before log_prob/entropy
+        # (logits.div_(temperature)); apply the same so old/train/ref stay unbiased.
+        temperature = float(batch.meta.get("temperature", 1.0) or 1.0)
+
+        # Pack ONE sequence per forward: dropping the left-pad and running plain
+        # causal attention on a single segment is correct regardless of whether
+        # the varlen (packing) attention patch is installed. Packing multiple
+        # sequences here would require that patch for cross-sequence isolation
+        # (which is disabled under LUMEN_DISABLE_HF_ATTN_PATCH=1 / pure SDPA).
+        import torch.distributed as dist
+
+        n_rows = B
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            # FSDP2 all-gathers per forward must run in lockstep across ranks;
+            # equalize the number of forwards (pad with a dummy last row).
+            cnt = torch.tensor([n_rows], device=self._device)
+            dist.all_reduce(cnt, op=dist.ReduceOp.MAX)
+            n_iters = int(cnt.item())
+        else:
+            n_iters = n_rows
+
+        lp_parts: list[torch.Tensor] = []
+        ent_parts: list[torch.Tensor] = []
+        module = self._engine.module
 
         with self._engine.eval_mode():
-            output = self._engine.infer_batch(data)
+            with torch.no_grad():
+                for i in range(n_iters):
+                    row = min(i, B - 1)  # dummy rows reuse the last real row
+                    ids_row = sequences[row:row + 1]
+                    mask_row = am[row:row + 1]
+                    packed = pack_sequences(ids_row, mask_row)
+                    with PackingContext(packed.cu_seqlens, packed.max_seqlen):
+                        outputs = module(
+                            input_ids=packed.input_ids,
+                            position_ids=packed.position_ids,
+                            attention_mask=None,
+                            use_cache=False,
+                        )
+                        logits = outputs.logits if hasattr(outputs, "logits") else outputs
+                        logits = logits.squeeze(0)
+                        flat_lp = packed_token_log_probs(
+                            logits, packed.input_ids.squeeze(0), packed.cu_seqlens,
+                            temperature=temperature,
+                        )
+                        token_lp = unpack_log_probs(
+                            flat_lp, packed.cu_seqlens, packed.seq_lens, S,
+                        )
+                        if want_entropy:
+                            flat_ent = packed_token_entropy(
+                                logits, packed.cu_seqlens,
+                                temperature=temperature, upcast=True,
+                            )
+                            token_ent = unpack_log_probs(
+                                flat_ent, packed.cu_seqlens, packed.seq_lens, S,
+                            )
+                        if i < n_rows:
+                            lp_parts.append(token_lp)
+                            if want_entropy:
+                                ent_parts.append(token_ent)
+                        del outputs, logits
 
-        log_probs = output["model_output"]["log_probs"]
-        out = DataProto(
-            tensors={"log_probs": log_probs.cpu(), "input_ids": batch["input_ids"]},
-            meta=dict(batch.meta),
-        )
+        log_probs = torch.cat(lp_parts, dim=0)
+        tensors = {"log_probs": log_probs.cpu(), "input_ids": batch["input_ids"]}
+        if want_entropy and ent_parts:
+            tensors["entropy"] = torch.cat(ent_parts, dim=0).cpu()
+        out = DataProto(tensors=tensors, meta=dict(batch.meta))
         return out
 
     def train_step(self, batch: DataProto) -> dict[str, float]:
@@ -184,24 +309,44 @@ class LumenActorWorker(BaseWorker):
                 if old_logp.shape[-1] != token_log_probs.shape[-1]:
                     old_logp = old_logp[..., :token_log_probs.shape[-1]]
 
-                mask = batch.tensors.get("attention_mask")
-                if mask is not None:
-                    mask = mask.to(token_log_probs.device)[..., :token_log_probs.shape[-1]].float()
+                # Prefer response_mask (PPO loss is over response tokens only).
+                # log_probs[:, j] predicts target token j+1, so shift the mask by
+                # one to align (verl-aligned); fall back to attention_mask.
+                L = token_log_probs.shape[-1]
+                resp_mask = batch.tensors.get("response_mask")
+                if resp_mask is not None:
+                    mask = resp_mask.to(token_log_probs.device).float()
+                    if mask.shape[-1] == L + 1:
+                        mask = mask[:, 1:]
+                    mask = mask[..., :L]
+                else:
+                    mask = batch.tensors.get("attention_mask")
+                    if mask is not None:
+                        mask = mask.to(token_log_probs.device)[..., :L].float()
 
-                algo_cfg = batch.meta.get("algo_config", {})
+                # Algo hyperparams live under the per-algo sub-config
+                # (algo_config[algo_name]); the flat top-level keys are None.
+                algo_cfg_full = batch.meta.get("algo_config", {}) or {}
+                _sub = algo_cfg_full.get(algo_name)
+                _sub = _sub if isinstance(_sub, dict) else {}
+
+                def _cfg(key, default):
+                    v = _sub.get(key, algo_cfg_full.get(key, default))
+                    return default if v is None else v
+
                 if algo_name == AlgorithmName.DAPO.value:
-                    clip_low = float(algo_cfg.get("clip_ratio_low", 0.2))
-                    clip_high = float(algo_cfg.get("clip_ratio_high", 0.28))
+                    clip_low = float(_cfg("clip_ratio_low", 0.2))
+                    clip_high = float(_cfg("clip_ratio_high", 0.28))
                     loss = asymmetric_clip_loss(
                         token_log_probs, old_logp, adv, clip_low, clip_high, mask=mask,
                     )
                 else:
-                    clip = float(algo_cfg.get("clip_ratio", 0.2))
+                    clip = float(_cfg("clip_ratio", 0.2))
                     loss = policy_gradient_loss(
                         token_log_probs, old_logp, adv, clip, mask=mask,
                     )
 
-                kl_c = float(algo_cfg.get("kl_coeff", 0.0))
+                kl_c = float(_cfg("kl_coeff", 0.0))
                 ref_logp = batch.tensors.get("ref_log_probs")
                 if kl_c > 0.0 and ref_logp is not None:
                     ref_logp = ref_logp.to(token_log_probs.device)
@@ -246,12 +391,211 @@ class LumenActorWorker(BaseWorker):
         self._log.debug("train_step loss=%f (algo=%s)", metrics.get("loss", 0.0), algo_name)
         return metrics
 
+    def update_policy(self, batch: DataProto) -> dict[str, float]:
+        """verl-aligned worker-side PPO update over this actor's DP shard.
+
+        The controller dispatches the full advantage-augmented batch across all
+        actors (each gets ``global / num_workers`` rows) with ``batch_num_tokens``
+        (GLOBAL response-token count) and ``dp_size`` in meta. This runs ONE
+        optimizer step; the engine micro-batches internally (grad accumulation),
+        deferring the FSDP2 reduce-scatter to the last micro. The per-token PG
+        loss is normalized by the global token count and dp_size-compensated, so
+        summing shard gradients (FSDP averages across ranks) yields the correct
+        global token-mean -- matching the validated torchrun path.
+        """
+        if self._engine is None:
+            raise RuntimeError("init_model() must be called before update_policy().")
+        if batch.batch_size == 0:
+            return {"loss": 0.0}
+
+        data: dict[str, Any] = {k: v for k, v in batch.tensors.items()}
+        # verl-aligned packed (remove-padding + varlen) training forward: the
+        # engine packs each micro, dropping all pad tokens. This is the forward
+        # that matches verl (use_remove_padding=True) and keeps old_log_probs
+        # (also packed) consistent with the train forward (ratio ~= 1). The old
+        # padded SDPA path flattened logits (AITER attn does not mask left-pad),
+        # inflating entropy ~7x.
+        data["use_packed_forward"] = True
+        data["temperature"] = float(batch.meta.get("temperature", 1.0) or 1.0)
+        # 1 sequence per micro (memory); grads accumulate across micros.
+        data["micro_batch_size"] = 1
+        self._pol_meta = dict(batch.meta)
+        if not getattr(self, "_logged_norm", False):
+            self._logged_norm = True
+            self._log.info(
+                "update_policy norm: batch_num_tokens=%s dp_size=%s rows=%d has_ris=%s",
+                self._pol_meta.get("batch_num_tokens"), self._pol_meta.get("dp_size"),
+                batch.batch_size, "rollout_is_weights" in batch.tensors,
+            )
+
+        with self._engine.train_mode():
+            output = self._engine.train_batch(data, self._policy_loss_fn)
+
+        metrics: dict[str, float] = {}
+        for k, v in output.get("metrics", {}).items():
+            metrics[k] = (sum(v) / len(v)) if isinstance(v, list) and v else float(v)
+        if "loss" in output:
+            lv = output["loss"]
+            metrics["loss"] = (sum(lv) / len(lv)) if isinstance(lv, list) and lv else float(lv)
+        metrics["lr"] = self._engine.lr_scheduler_step()
+        return metrics
+
+    def _policy_loss_fn(self, model_output, data):
+        """DAPO/GRPO surrogate on ONE micro, using the micro's own tensors.
+
+        Reads old_log_probs/advantages/response_mask/rollout_is_weights from the
+        micro (``data``) -- NOT a closed-over full batch -- so shapes always
+        match ``model_output``. Applies dual-clip + TIS + global-token
+        normalization (batch_num_tokens / dp_size from meta), matching verl.
+        """
+        token_log_probs = model_output["log_probs"]
+        L = token_log_probs.shape[-1]
+        dev = token_log_probs.device
+        meta = getattr(self, "_pol_meta", {}) or {}
+        algo_name = str(meta.get("algorithm", "dapo")).lower()
+
+        old_logp = data.get("old_log_probs")
+        adv = data.get("advantages")
+        if old_logp is None or adv is None:
+            shift_labels = data["input_ids"][:, 1:].contiguous().to(dev)
+            loss = F.cross_entropy(token_log_probs.reshape(-1, token_log_probs.shape[-1]) if token_log_probs.dim() == 3 else token_log_probs.reshape(-1), shift_labels.reshape(-1))
+            return loss, {"loss": float(loss.detach())}
+
+        # response mask aligned to [., L]
+        resp_mask = data.get("response_mask")
+        if resp_mask is not None:
+            mask = resp_mask.to(dev).float()
+            if mask.shape[-1] == L + 1:
+                mask = mask[:, 1:]
+            mask = mask[..., :L]
+        else:
+            am = data.get("attention_mask")
+            mask = am.to(dev)[..., :L].float() if am is not None else None
+
+        old_logp = old_logp.to(dev)[..., :L]
+        adv = adv.to(dev)
+        if adv.dim() == 1:
+            adv = adv.unsqueeze(-1).expand_as(token_log_probs)
+        elif adv.shape[-1] != L:
+            adv = adv[..., :L]
+
+        algo_cfg_full = meta.get("algo_config", {}) or {}
+        _sub = algo_cfg_full.get(algo_name)
+        _sub = _sub if isinstance(_sub, dict) else {}
+
+        def _cfg(key, default):
+            v = _sub.get(key, algo_cfg_full.get(key, default))
+            return default if v is None else v
+
+        bnt = meta.get("batch_num_tokens")
+        dp = int(meta.get("dp_size", 1) or 1)
+        ris = data.get("rollout_is_weights")
+        if ris is not None:
+            ris = ris.to(dev)
+            if ris.dim() > 1 and ris.shape[-1] != L:
+                ris = ris[..., :L]
+
+        if algo_name == AlgorithmName.DAPO.value:
+            loss = asymmetric_clip_loss(
+                token_log_probs, old_logp, adv,
+                float(_cfg("clip_ratio_low", 0.2)), float(_cfg("clip_ratio_high", 0.28)),
+                mask=mask, clip_ratio_c=float(_cfg("clip_ratio_c", 0.0)),
+                batch_num_tokens=bnt, dp_size=dp, rollout_is_weights=ris,
+            )
+        else:
+            loss = policy_gradient_loss(
+                token_log_probs, old_logp, adv, float(_cfg("clip_ratio", 0.2)), mask=mask,
+            )
+
+        kl_c = float(_cfg("kl_coeff", 0.0))
+        ref_logp = data.get("ref_log_probs")
+        if kl_c > 0.0 and ref_logp is not None:
+            ref_logp = ref_logp.to(dev)[..., :L]
+            loss = loss + kl_c * kl_penalty(token_log_probs, ref_logp, mask=mask)
+
+        # KL diagnostics (verl-aligned, detached, over response tokens). Return
+        # per-micro SUM + token COUNT (not a per-sequence mean): the controller
+        # aggregates as a GLOBAL token-weighted mean (verl masked_mean over the
+        # whole batch). A mean-of-per-sequence-means would over-weight short/
+        # outlier sequences and make core/kl look much noisier than verl.
+        #   ppo_kl          = Σ(old_logp - new_logp) / Σtok  -> verl actor/ppo_kl
+        #   rollout_corr/kl = Σ(rollout_logp - new_logp) / Σtok -> verl rollout_corr/kl
+        out_metrics = {"loss": float(loss.detach())}
+        if mask is not None:
+            with torch.no_grad():
+                tok = float(mask.sum())
+                out_metrics["ppo_kl_sum"] = float(((old_logp - token_log_probs) * mask).sum())
+                out_metrics["ppo_kl_tok"] = tok
+                rlp = data.get("rollout_log_probs")
+                if rlp is not None:
+                    rlp = rlp.to(dev)[..., :L]
+                    out_metrics["rollout_corr_kl_sum"] = float(((rlp - token_log_probs) * mask).sum())
+                    out_metrics["rollout_corr_kl_tok"] = tok
+        return loss, out_metrics
+
     def get_state_dict(self) -> dict[str, torch.Tensor]:
-        """CPU state dict for weight sync to rollout engines."""
+        """CPU full state dict for weight sync to rollout engines.
+
+        FSDP2 shards parameters as ``DTensor`` across the actor process group,
+        so ``full_tensor()`` all-gathers the unsharded tensor. This is a
+        COLLECTIVE op: every actor must call ``get_state_dict`` concurrently or
+        the all-gather deadlocks (see ``_fetch_actor_cpu_state``).
+        """
         if self._engine is None:
             raise RuntimeError("init_model() must be called before get_state_dict().")
+        from torch.distributed.tensor import DTensor
+
         params, _ = self._engine.get_per_tensor_param()
-        return {k: v.detach().cpu() for k, v in params}
+        out: dict[str, torch.Tensor] = {}
+        for name, param in params:
+            full = param.full_tensor() if isinstance(param, DTensor) else param
+            out[name] = full.detach().cpu()
+        return out
+
+    def update_weights_ipc_send(
+        self, bucket_size_mb: int = 512, use_shm: bool = False,
+    ) -> bool:
+        """Stream full (all-gathered) BF16 weights to the colocated vLLM replica.
+
+        verl-aligned ZMQ CUDA-IPC weight sync. ``full_tensor()`` is an FSDP
+        all-gather COLLECTIVE, so every actor must call this concurrently (the
+        trainer dispatches it to all actors at once). Each actor sends to its
+        own replica's socket keyed by ``{job_id, replica_rank=self.rank,
+        local_rank=0}`` -- matching the receiver's ``_get_zmq_handle``. The
+        receiver is started separately (server.update_weights_from_ipc) and
+        both run concurrently.
+        """
+        if self._engine is None:
+            raise RuntimeError("init_model() must be called before update_weights_ipc_send().")
+
+        import asyncio
+
+        import ray
+        from torch.distributed.tensor import DTensor
+
+        from lumenrl.engine.inference.bucketed_weight_transfer import BucketedWeightSender
+
+        job_id = ray.get_runtime_context().get_job_id()
+        handle = f"ipc:///tmp/lumen-colocate-zmq-{job_id}-replica-{self.rank}-rank-0.sock"
+        keep_fp32 = os.environ.get("LUMENRL_SYNC_FP32") == "1"
+
+        params, _ = self._engine.get_per_tensor_param()
+
+        def _gen():
+            for name, param in params:
+                full = param.full_tensor() if isinstance(param, DTensor) else param
+                full = full.detach()
+                if full.dtype == torch.float32 and not keep_fp32:
+                    full = full.to(torch.bfloat16)
+                if not full.is_cuda:
+                    full = full.to("cuda", non_blocking=True)
+                yield name, full
+
+        sender = BucketedWeightSender(
+            zmq_handle=handle, bucket_size_mb=int(bucket_size_mb), use_shm=bool(use_shm)
+        )
+        asyncio.run(sender.async_send_weights(_gen()))
+        return True
 
     def cleanup(self) -> None:
         self._engine = None

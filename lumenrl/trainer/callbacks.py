@@ -252,8 +252,12 @@ class WandbCallback(Callback):
         "timing/gen_s": "core/gen_time_s",
         "timing/train_s": "core/train_time_s",
         "rollout_correction/kl": "core/kl",
+        "rollout_corr/kl": "core/kl",
+        "ppo_kl": "core/ppo_kl",
         "mismatch_kl": "core/mismatch_kl",
         "entropy": "core/entropy",
+        "val-core/acc/mean@1": "core/val_accuracy",
+        "val/response_length_mean": "core/val_response_len",
         "grad_norm": "core/grad_norm",
         "loss": "core/loss",
     }

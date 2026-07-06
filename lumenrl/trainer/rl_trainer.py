@@ -102,6 +102,10 @@ class RLTrainer:
         # generation rounds, not just steps).
         self._prompt_cursor: int = 0
         self._prompt_perm: Any = None
+        # verl-aligned Ray rollout (ray_http transport); populated in setup.
+        self._ray_use_vllm: bool = False
+        self._ray_vllm_engine: Any = None
+        self._ray_rollout_mgr: Any = None
         self._is_distributed: bool = torch.distributed.is_initialized()
         self._rank: int = torch.distributed.get_rank() if self._is_distributed else 0
         self._world_size: int = torch.distributed.get_world_size() if self._is_distributed else 1
@@ -320,13 +324,220 @@ class RLTrainer:
                      self._rank, self.config.algorithm.name, model_name, self._world_size, self._use_atom, self._resume_step)
         self._init_profiler()
 
+    def _rendezvous_ray_group(self, wg: "RayWorkerGroup", timeout_s: int = 7200) -> None:
+        """Form a cross-actor torch.distributed group so FSDP2 shards + syncs grads.
+
+        verl-aligned: pick the master address from actor rank 0's node plus a
+        free port, then have every actor join a single ``world_size``-rank NCCL
+        group (each pinned to its own GPU as ``local_rank=0``). Must run BEFORE
+        ``init_model`` so the FSDP backend sees an initialized process group and
+        applies ``fully_shard`` instead of falling back to an unsharded replica.
+        """
+        import ray
+
+        n = wg.num_workers
+        if n <= 0:
+            return
+        master_addr = wg.call_single(0, "get_node_ip")
+        master_port = wg.call_single(0, "find_free_port")
+        refs = [
+            wg.call_single_async(
+                i,
+                "setup_distributed",
+                rank=i,
+                world_size=n,
+                master_addr=master_addr,
+                master_port=master_port,
+                local_rank=0,
+                timeout_s=timeout_s,
+            )
+            for i in range(n)
+        ]
+        ray.get(refs)
+        logger.info(
+            "Ray rendezvous complete: %d actors on %s:%s (FSDP2 sharded).",
+            n, master_addr, master_port,
+        )
+
+    def _setup_ray_vllm_rollout(self, model_name: str, vcfg: Any) -> None:
+        """Build verl-style colocated vLLM rollout replicas + client (ray_http)."""
+        from lumenrl.engine.inference.vllm_http_engine import VLLMHttpEngine
+        from lumenrl.engine.inference.vllm_ray_server import VLLMReplicaManager
+
+        seed = self.config.seed if getattr(vcfg, "seed", None) is None else vcfg.seed
+        engine_kwargs: dict[str, Any] = dict(
+            tensor_parallel_size=1,
+            gpu_memory_utilization=float(vcfg.gpu_memory_utilization),
+            dtype=str(vcfg.dtype),
+            enforce_eager=bool(vcfg.enforce_eager),
+            enable_chunked_prefill=bool(vcfg.enable_chunked_prefill),
+            max_num_batched_tokens=int(vcfg.max_num_batched_tokens),
+            max_num_seqs=int(vcfg.max_num_seqs),
+            trust_remote_code=bool(vcfg.trust_remote_code),
+            enable_sleep_mode=bool(vcfg.enable_sleep_mode),
+            disable_log_stats=True,
+        )
+        # NOTE: seed is set PER REPLICA in the server (base_seed + replica_rank),
+        # matching verl (``seed = replica_rank + data.seed``). Setting one shared
+        # engine seed here would make all replicas sample from the same RNG.
+        if vcfg.max_model_len:
+            engine_kwargs["max_model_len"] = int(vcfg.max_model_len)
+        if vcfg.kv_cache_dtype and vcfg.kv_cache_dtype != "auto":
+            engine_kwargs["kv_cache_dtype"] = str(vcfg.kv_cache_dtype)
+        if vcfg.quantization:
+            engine_kwargs["quantization"] = str(vcfg.quantization)
+
+        mgr = VLLMReplicaManager(
+            self._actor_wg,
+            model_name,
+            engine_kwargs,
+            base_port=int(vcfg.ray_http_base_port),
+            start_http=bool(vcfg.ray_http_start_server),
+            max_concurrency=max(8, int(vcfg.max_num_seqs)),
+            base_seed=(int(seed) if seed is not None else None),
+        )
+        mgr.create()
+        self._ray_rollout_mgr = mgr
+        self._ray_vllm_engine = VLLMHttpEngine(
+            mgr, sleep_level=int(vcfg.sleep_level), enable_sleep=bool(vcfg.enable_sleep_mode),
+        )
+        logger.info(
+            "Ray vLLM rollout ready: %d colocated replicas (TP=1, ZMQ IPC weight sync).",
+            mgr.num_replicas,
+        )
+
+    def _rollout_with_ray_vllm(
+        self, prompts: list[str], num_generations: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor | None]:
+        """Token-in/token-out DP rollout across colocated vLLM replicas.
+
+        Returns ``(sequences, seq_mask, prompt_lengths, rollout_log_probs)`` with
+        left-padded prompts and right-appended responses -- the same layout the
+        FSDP forward + reward code expects. ``rollout_log_probs`` is populated
+        only when ``vllm_cfg.calculate_log_probs`` is set (TIS/MIS correction).
+        """
+        vcfg = self.config.policy.generation.vllm_cfg
+        tok = self._tokenizer
+        pad_id = tok.pad_token_id or 0
+        want_lp = bool(vcfg.calculate_log_probs)
+
+        # Send pre-tokenized prompt_token_ids (verl's token-in path), NOT the
+        # prompt string. A controlled A/B (identical prompts/params/seed/base
+        # weights) showed vLLM's INTERNAL string tokenization diverges from the
+        # token-in path even when the offline HF ids are identical: the string
+        # path generated ~15% longer responses with 2.4x more cap-hits. Feeding
+        # HF-tokenized ids (add_special_tokens=False, matching verl's
+        # apply_chat_template(tokenize=True)) makes response length match verl.
+        expanded: list[list[int]] = []
+        for p in prompts:
+            ids = self._tokenizer(p, add_special_tokens=False)["input_ids"]
+            expanded.extend([list(ids)] * num_generations)
+
+        sp = self._ray_sampling_params(want_lp)
+        results = self._ray_vllm_engine.generate_tokens(expanded, sp)
+
+        # Assemble left-padded prompt + response into a single tensor block.
+        seqs_tok: list[list[int]] = []
+        plens: list[int] = []
+        resp_lps: list[list[float]] = []
+        for res in results:
+            p_ids = res["prompt_token_ids"]
+            g_ids = res["token_ids"]
+            seqs_tok.append(list(p_ids) + list(g_ids))
+            plens.append(len(p_ids))
+            if want_lp:
+                resp_lps.append(res.get("logprobs") or [0.0] * len(g_ids))
+
+        max_len = max(len(s) for s in seqs_tok)
+        b = len(seqs_tok)
+        sequences = torch.full((b, max_len), pad_id, dtype=torch.long)
+        seq_mask = torch.zeros((b, max_len), dtype=torch.long)
+        prompt_lengths: list[int] = []
+        for i, s in enumerate(seqs_tok):
+            # left-pad so real tokens sit at the right end (matches pack_sequences)
+            start = max_len - len(s)
+            sequences[i, start:] = torch.tensor(s, dtype=torch.long)
+            seq_mask[i, start:] = 1
+            # _build_response_mask expects the REAL prompt token count (it locates
+            # the first non-pad position itself), NOT the absolute start offset.
+            prompt_lengths.append(plens[i])
+
+        rollout_lp = None
+        if want_lp:
+            rollout_lp = torch.zeros((b, max_len - 1), dtype=torch.float32)
+            for i, s in enumerate(seqs_tok):
+                start = max_len - len(s)
+                # response log-probs align to target positions after the prompt
+                resp_start = start + plens[i] - 1
+                lps = resp_lps[i]
+                for j, lp in enumerate(lps):
+                    col = resp_start + j
+                    if 0 <= col < max_len - 1:
+                        rollout_lp[i, col] = lp
+
+        sequences = sequences.to(self._device)
+        seq_mask = seq_mask.to(self._device)
+        if rollout_lp is not None:
+            rollout_lp = rollout_lp.to(self._device)
+        return sequences, seq_mask, prompt_lengths, rollout_lp
+
+    def _ray_sampling_params(self, want_logprobs: bool) -> dict[str, Any]:
+        """Sampling params matching _rollout_with_vllm for cross-transport parity."""
+        vcfg = self.config.policy.generation.vllm_cfg
+        algo_name = self.config.algorithm.name.lower()
+        max_total = int(getattr(self.config.policy, "max_total_sequence_length", 0) or 0)
+        max_resp = int(getattr(self.config.policy, "max_response_length", 0) or 0)
+        max_tok = max_resp if max_resp > 0 else max(128, max_total // 2)
+        sp: dict[str, Any] = {
+            "max_tokens": max_tok,
+            "temperature": float(vcfg.temperature),
+            "top_p": float(vcfg.top_p),
+            "top_k": int(vcfg.top_k),
+        }
+        if algo_name in ("dapo", "grpo") and vcfg.temperature == 0.0:
+            sp["temperature"] = 1.0
+        if want_logprobs:
+            sp["logprobs"] = 0
+        return sp
+
+    def _sync_weights_ipc(self) -> None:
+        """verl-aligned weight sync: wake weights -> ZMQ IPC -> wake KV cache.
+
+        The training actors (senders) and colocated vLLM workers (receivers) run
+        concurrently: each actor all-gathers its full BF16 weights and streams
+        them over CUDA IPC to its own replica's socket.
+        """
+        import ray
+
+        mgr = self._ray_rollout_mgr
+        if mgr is None or self._actor_wg is None:
+            return
+        vcfg = self.config.policy.generation.vllm_cfg
+        bmb = int(vcfg.update_weights_bucket_megabytes)
+        use_shm = bool(vcfg.use_shm)
+        sleeping = bool(getattr(self._ray_vllm_engine, "enable_sleep", False))
+
+        # 1) wake weight memory before loading (only when sleep is in use).
+        if sleeping:
+            mgr.wake_all(tags=["weights"])
+        # 2) start receivers + senders concurrently, then join both.
+        recv = [s.update_weights_from_ipc.remote(use_shm) for s in mgr.servers]
+        send = self._actor_wg.execute_all_async(
+            "update_weights_ipc_send", bucket_size_mb=bmb, use_shm=use_shm
+        )
+        ray.get(send)
+        ray.get(recv)
+        # 3) wake KV cache so the next rollout can run.
+        if sleeping:
+            mgr.wake_all(tags=["kv_cache"])
+
     def _setup_ray_controller(self) -> None:
         """Initialize Ray cluster + worker groups for actor/ref orchestration."""
         if RayCluster is None or RayWorkerGroup is None:
             raise RuntimeError("Ray controller modules are unavailable in this environment.")
         if not self._use_atom:
             raise NotImplementedError(
-                "Ray controller path currently requires policy.generation_backend=atom."
+                "Ray controller path currently requires policy.generation_backend in {atom, vllm}."
             )
 
         # Main path should not depend on torch.distributed collectives.
@@ -383,6 +594,7 @@ class RLTrainer:
                 detached=actor_role.detached,
             )
             fused_wg.start()
+            self._rendezvous_ray_group(fused_wg)
             spawned = fused_wg.spawn(["actor", "ref"])
             self._actor_wg = spawned["actor"]
             self._ref_wg = spawned["ref"]
@@ -398,6 +610,7 @@ class RLTrainer:
                 detached=actor_role.detached,
             )
             self._actor_wg.start()
+            self._rendezvous_ray_group(self._actor_wg)
             self._actor_wg.call_all("init_model")
 
         if use_ref and self._ref_wg is None:
@@ -418,6 +631,7 @@ class RLTrainer:
                 detached=ref_role.detached,
             )
             self._ref_wg.start()
+            self._rendezvous_ray_group(self._ref_wg)
             self._ref_wg.call_all("init_model")
 
         from transformers import AutoTokenizer
@@ -426,9 +640,17 @@ class RLTrainer:
             self._tokenizer.pad_token = self._tokenizer.eos_token
         self._tokenizer.padding_side = "left"
 
-        from lumenrl.engine.inference.atom_engine import AtomEngine
-        atom_cfg = self.config.policy.generation.atom_cfg
-        self._atom_engine = AtomEngine(config=atom_cfg, model_name=model_name)
+        vcfg = self.config.policy.generation.vllm_cfg
+        self._ray_use_vllm = self._use_vllm and str(getattr(vcfg, "transport", "fifo")) == "ray_http"
+        self._ray_rollout_mgr = None
+        self._ray_vllm_engine = None
+        if self._ray_use_vllm:
+            self._setup_ray_vllm_rollout(model_name, vcfg)
+            self._atom_engine = None
+        else:
+            from lumenrl.engine.inference.atom_engine import AtomEngine
+            atom_cfg = self.config.policy.generation.atom_cfg
+            self._atom_engine = AtomEngine(config=atom_cfg, model_name=model_name)
         self._load_dataset()
 
         # ---- Validation dataset ----
@@ -902,7 +1124,10 @@ class RLTrainer:
         if self._use_ray_controller:
             if self._actor_wg is None:
                 return None
-            state = self._actor_wg.call_single(0, "get_state_dict")
+            # full_tensor() inside get_state_dict is an FSDP all-gather collective:
+            # invoke on ALL actors concurrently, then keep rank 0's gathered copy.
+            states = self._actor_wg.execute_all_sync("get_state_dict")
+            state = states[0]
             return {k: v.detach().cpu().contiguous() for k, v in state.items()}
 
         if self._actor_model is None:
@@ -1336,7 +1561,9 @@ class RLTrainer:
             gen_prompts = train_prompts
 
         def _one_round(prompts: list[str]):
-            if self._use_vllm:
+            if getattr(self, "_ray_use_vllm", False) and self._ray_vllm_engine is not None:
+                seqs, mask, plen, lp = self._rollout_with_ray_vllm(prompts, g)
+            elif self._use_vllm:
                 seqs, mask, plen, lp = self._rollout_with_vllm(prompts, g)
             elif self._use_atom and self._atom_engine is not None:
                 seqs, mask, plen = self._rollout_with_atom(prompts, g)
@@ -2736,8 +2963,23 @@ class RLTrainer:
         wg: RayWorkerGroup,
         sequences: torch.Tensor,
         role: str,
-    ) -> torch.Tensor:
-        req = DataProto(tensors={"input_ids": sequences.detach().cpu()}, meta={})
+        want_entropy: bool = False,
+        attention_mask: torch.Tensor | None = None,
+    ):
+        meta = {"calculate_entropy": True} if want_entropy else {}
+        # verl-aligned packed forward on the worker needs the temperature (for
+        # logits.div_) and a per-GPU token budget for chunking the flat forward.
+        meta["temperature"] = float(
+            getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0
+        )
+        meta["max_token_len_per_gpu"] = int(self.config.policy.max_token_len_per_gpu)
+        req_tensors = {"input_ids": sequences.detach().cpu()}
+        # CRITICAL: the worker must receive the padding mask, otherwise it runs the
+        # forward over left-pad tokens with arange positions -> flat logits and
+        # ~7x inflated entropy. This is the packed-varlen forward's `attention_mask`.
+        if attention_mask is not None:
+            req_tensors["attention_mask"] = attention_mask.detach().cpu()
+        req = DataProto(tensors=req_tensors, meta=meta)
         role_cfg = self.config.controller.ray.actor if role == "actor" else self.config.controller.ray.ref
         out = wg.dispatch_and_call(
             "compute_log_probs",
@@ -2747,10 +2989,15 @@ class RLTrainer:
             lazy_key=role_cfg.lazy_dispatch_key,
         )
         if "log_probs" in out.tensors:
-            return out["log_probs"].to(self._device)
-        if "ref_log_probs" in out.tensors:
-            return out["ref_log_probs"].to(self._device)
-        raise KeyError(f"Expected log_probs/ref_log_probs in worker output, got keys={list(out.tensors.keys())}")
+            logp = out["log_probs"].to(self._device)
+        elif "ref_log_probs" in out.tensors:
+            logp = out["ref_log_probs"].to(self._device)
+        else:
+            raise KeyError(f"Expected log_probs/ref_log_probs in worker output, got keys={list(out.tensors.keys())}")
+        if want_entropy:
+            ent = out.tensors.get("entropy")
+            return logp, (ent.to(self._device) if ent is not None else None)
+        return logp
 
     def _update_actor_with_ray(self, batch: DataProto) -> dict[str, float]:
         if self._actor_wg is None:
@@ -2767,22 +3014,27 @@ class RLTrainer:
         if not chunks:
             return {"loss": 0.0}
 
-        if len(chunks) == 1:
-            worker_and_chunks = [(0, chunks[0])]
-        elif len(chunks) == self._actor_wg.num_workers:
-            worker_and_chunks = list(enumerate(chunks))
+        import ray
+
+        n = self._actor_wg.num_workers
+        # FSDP2 shards params + reduce-scatters grads ACROSS the actor process
+        # group, so train_step must run on ALL actors concurrently (lockstep).
+        # Calling a subset (or sequentially) would deadlock the collectives.
+        if len(chunks) == 1 and n == 1:
+            refs = [self._actor_wg.call_single_async(0, "update_policy", chunks[0])]
+        elif len(chunks) == n:
+            refs = [
+                self._actor_wg.call_single_async(i, "update_policy", chunks[i])
+                for i in range(n)
+            ]
         else:
             raise ValueError(
                 f"actor dispatch produced {len(chunks)} chunks for "
-                f"{self._actor_wg.num_workers} workers; expected 1 (rank-zero) "
-                "or num_workers."
+                f"{n} workers; expected 1 (single-actor) or num_workers "
+                "(FSDP requires every actor to participate)."
             )
 
-        outputs: list[dict[str, float]] = []
-        for i, chunk in worker_and_chunks:
-            if chunk.batch_size == 0:
-                continue
-            outputs.append(self._actor_wg.call_single(i, "train_step", chunk))
+        outputs: list[dict[str, float]] = ray.get(refs)
         if not outputs:
             return {"loss": 0.0}
         merged: dict[str, float] = {}
@@ -2796,8 +3048,8 @@ class RLTrainer:
         """Ray worker orchestration path (no torch.distributed collectives)."""
         if self._algorithm is None or self._actor_wg is None:
             raise RuntimeError("Call setup() before train().")
-        if self._atom_engine is None:
-            raise RuntimeError("Ray controller path currently requires ATOM rollout.")
+        if self._atom_engine is None and self._ray_vllm_engine is None:
+            raise RuntimeError("Ray controller path requires an ATOM or ray_http vLLM rollout engine.")
 
         for cb in self.callbacks:
             cb.on_train_begin(self)
@@ -2805,6 +3057,7 @@ class RLTrainer:
         num_generations = _algo_num_generations(self.config)
         total_steps = int(self.config.num_training_steps)
         start_step = self._resume_step
+        use_ray_vllm = bool(getattr(self, "_ray_use_vllm", False) and self._ray_vllm_engine is not None)
 
         for step in range(start_step, total_steps):
             step_start = time.time()
@@ -2813,63 +3066,101 @@ class RLTrainer:
             for cb in self.callbacks:
                 cb.on_step_begin(self, step)
 
-            prompts, ground_truths = self._get_batch_prompts(step)
-            input_ids, attention_mask = self._tokenize_prompts(prompts)
-
+            # ---- rollout ----
             gen_t0 = time.time()
-            sequences, seq_mask, prompt_lengths = self._rollout_with_atom(prompts, num_generations)
+            rollout_lp = None
+            if use_ray_vllm:
+                # verl-aligned online rollout across colocated replicas, with
+                # DAPO filter_groups dynamic sampling handled in the collector.
+                (sequences, seq_mask, prompt_lengths, rewards, responses,
+                 ground_truths_expanded, rollout_lp) = self._collect_rollout_batch(step, num_generations)
+                # free rollout KV so the FSDP training pass has GPU headroom.
+                self._ray_vllm_engine.sleep()
+            else:
+                prompts, ground_truths = self._get_batch_prompts(step)
+                sequences, seq_mask, prompt_lengths = self._rollout_with_atom(prompts, num_generations)
+                rewards, responses = None, None
+                ground_truths_expanded = ground_truths * num_generations
             gen_time = time.time() - gen_t0
 
-            old_log_probs = self._compute_log_probs_with_worker_group(self._actor_wg, sequences, role="actor")
+            old_log_probs, entropy_full = self._compute_log_probs_with_worker_group(
+                self._actor_wg, sequences, role="actor", want_entropy=True,
+                attention_mask=seq_mask,
+            )
             if self._ref_wg is not None:
-                ref_log_probs = self._compute_log_probs_with_worker_group(self._ref_wg, sequences, role="ref")
+                ref_log_probs = self._compute_log_probs_with_worker_group(
+                    self._ref_wg, sequences, role="ref", attention_mask=seq_mask,
+                )
             else:
                 ref_log_probs = torch.zeros_like(old_log_probs)
 
             ref_time = max(0.0, time.time() - (gen_t0 + gen_time))
-            rewards, responses = self._compute_rewards(
-                sequences, prompt_lengths, ground_truths, num_generations,
-            )
+            if rewards is None:
+                rewards, responses = self._compute_rewards(
+                    sequences, prompt_lengths, ground_truths, num_generations,
+                )
             response_mask = self._build_response_mask(sequences, seq_mask, prompt_lengths)
             response_lengths = [int(response_mask[i].sum().item()) for i in range(response_mask.shape[0])]
 
+            tensors = {
+                "input_ids": sequences,
+                "attention_mask": seq_mask,
+                "old_log_probs": old_log_probs,
+                "ref_log_probs": ref_log_probs,
+                "rewards": rewards,
+                "response_mask": response_mask,
+            }
+            if rollout_lp is not None:
+                tensors["rollout_log_probs"] = rollout_lp
             batch = DataProto(
-                tensors={
-                    "input_ids": sequences,
-                    "attention_mask": seq_mask,
-                    "old_log_probs": old_log_probs,
-                    "ref_log_probs": ref_log_probs,
-                    "rewards": rewards,
-                    "response_mask": response_mask,
-                },
+                tensors=tensors,
                 meta={
                     "algorithm": self.config.algorithm.name,
                     "response_lengths": response_lengths,
                     "responses": responses,
-                    "ground_truths": ground_truths * num_generations,
+                    "ground_truths": ground_truths_expanded,
                     "algo_config": self._to_plain_dict(self.config.algorithm),
+                    # verl-aligned packed training forward divides logits by the
+                    # sampling temperature (logits.div_(temperature)); pass it so
+                    # the worker applies the same convention as old/ref log-probs.
+                    "temperature": float(
+                        getattr(self.config.policy.generation.vllm_cfg, "temperature", 1.0) or 1.0
+                    ),
                 },
             )
 
             batch = self._algorithm.compute_advantages(batch)
             batch = apply_rollout_correction(batch, self.config)
 
+            if use_ray_vllm:
+                # verl-aligned loss normalization: GLOBAL response-token count
+                # (full batch) + dp_size so each actor's shard normalizes by the
+                # global denominator and FSDP grad averaging yields token-mean.
+                _rmask = batch.tensors.get("response_mask")
+                if _rmask is not None:
+                    batch.meta["batch_num_tokens"] = int(_rmask.sum().item())
+                batch.meta["dp_size"] = int(self._actor_wg.num_workers)
+
+            # ---- train (worker-side PPO mini-batch loop; FSDP grad sync) ----
             train_t0 = time.time()
-            micro_bs = max(1, int(self.config.policy.train_micro_batch_size))
-            max_tok = int(self.config.policy.max_token_len_per_gpu)
-            mini_batches = self._dynamic_mini_batches(batch, max_tok, micro_bs)
-
-            metrics_accum: dict[str, float] = {}
-            for mini in mini_batches:
-                m = self._update_actor_with_ray(mini)
-                for k, v in m.items():
-                    metrics_accum[k] = metrics_accum.get(k, 0.0) + float(v)
+            metrics = self._update_actor_with_ray(batch)
             train_time = time.time() - train_t0
-            denom = max(1, len(mini_batches))
-            metrics = {k: v / denom for k, v in metrics_accum.items()}
 
-            prompt_tok = int(attention_mask.repeat_interleave(num_generations, dim=0).to(seq_mask.device).sum().item())
-            gen_tokens = int(seq_mask.sum().item()) - prompt_tok
+            # verl-aligned GLOBAL token-weighted KL (Σkl / Σtok), not a mean of
+            # per-sequence means (which over-weights short/outlier seqs and makes
+            # core/kl look far noisier than verl). Workers return sum+tok.
+            _ks = metrics.pop("rollout_corr_kl_sum", None)
+            _kt = metrics.pop("rollout_corr_kl_tok", None)
+            if _ks is not None and _kt:
+                metrics["rollout_corr/kl"] = _ks / max(_kt, 1e-6)
+            _ps = metrics.pop("ppo_kl_sum", None)
+            _pt = metrics.pop("ppo_kl_tok", None)
+            if _ps is not None and _pt:
+                metrics["ppo_kl"] = _ps / max(_pt, 1e-6)
+
+            total_tok = int(seq_mask.sum().item())
+            prompt_tok = int(sum(prompt_lengths))
+            gen_tokens = max(0, total_tok - prompt_tok)
             metrics["timing/step_s"] = time.time() - step_start
             metrics["timing/gen_s"] = gen_time
             metrics["timing/ref_s"] = ref_time
@@ -2880,6 +3171,22 @@ class RLTrainer:
             metrics["reward/accuracy"] = float(sum(1 for r in rewards if r > 0) / max(1, len(rewards)))
             metrics["seq/max_len"] = int(sequences.shape[1])
             metrics["seq/mean_response_len"] = float(sum(response_lengths) / max(1, len(response_lengths)))
+            # verl-aligned actor/entropy: token-weighted mean over response tokens.
+            if entropy_full is not None:
+                _em = response_mask.to(entropy_full.device).to(entropy_full.dtype)
+                _ec = entropy_full[..., : _em.shape[-1]] if entropy_full.shape[-1] != _em.shape[-1] else entropy_full
+                _denom = float(_em.sum().item())
+                if _denom > 0:
+                    metrics["entropy"] = float((_ec * _em).sum().item() / _denom)
+                    if step < 2:
+                        _olp = old_log_probs.to(_em.device)
+                        _olp = _olp[..., : _em.shape[-1]]
+                        _neglp = float((-_olp * _em).sum().item() / _denom)
+                        logger.info(
+                            "ENT_DIAG step=%d resp_ent=%.3f all_ent=%.3f resp_neglogp=%.3f mask_tok=%d ent_max=%.2f",
+                            step, metrics["entropy"], float(entropy_full.mean().item()),
+                            _neglp, int(_denom), float(entropy_full.max().item()),
+                        )
 
             # Validation
             val_steps = getattr(self.config, 'val_steps', 0)
@@ -2891,8 +3198,12 @@ class RLTrainer:
             for k, v in metrics.items():
                 self._metrics.update(k, v)
 
+            # ---- weight sync to rollout engine ----
             t_sync = time.time()
-            self._sync_rollout_weights()
+            if use_ray_vllm:
+                self._sync_weights_ipc()   # wake weights -> ZMQ IPC -> wake KV
+            else:
+                self._sync_rollout_weights()
             sync_time = time.time() - t_sync
             if sync_time > 1.0:
                 metrics["timing/weight_sync_s"] = sync_time
@@ -2903,7 +3214,7 @@ class RLTrainer:
             self._maybe_stop_profile(step)
 
             del sequences, seq_mask, old_log_probs, ref_log_probs
-            del rewards, responses, response_mask, batch, mini_batches
+            del rewards, responses, response_mask, batch
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -2954,8 +3265,14 @@ class RLTrainer:
                 prompts.append(p)
                 ground_truths.append(gt)
 
-            # Greedy eval generation (colocated, broadcast to all ranks).
-            if self._use_vllm and self._atom_engine is not None:
+            # Eval generation (colocated). Ray-controller path generates via the
+            # colocated vLLM replicas (self._actor_model is None on the driver, so
+            # the torchrun _rollout_phase fallback would crash).
+            if getattr(self, "_ray_vllm_engine", None) is not None:
+                sequences, seq_mask, prompt_lengths, _ = self._rollout_with_ray_vllm(
+                    prompts, num_generations=1,
+                )
+            elif self._use_vllm and self._atom_engine is not None:
                 sequences, seq_mask, prompt_lengths, _ = self._rollout_with_vllm(
                     prompts, num_generations=1, eval_mode=True,
                 )
@@ -3041,6 +3358,13 @@ class RLTrainer:
         if self._atom_engine is not None:
             self._atom_engine.shutdown()
             self._atom_engine = None
+        if self._ray_vllm_engine is not None:
+            try:
+                self._ray_vllm_engine.shutdown()
+            except Exception:
+                pass
+            self._ray_vllm_engine = None
+            self._ray_rollout_mgr = None
         if self._engine is not None:
             del self._engine
             self._engine = None

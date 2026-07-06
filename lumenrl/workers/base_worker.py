@@ -48,6 +48,96 @@ class BaseWorker(ABC):
     def init_model(self) -> None:
         """Allocate models, optimizers, and device state."""
 
+    # ------------------------------------------------------------------
+    # Distributed rendezvous (Ray controller path, verl-aligned)
+    # ------------------------------------------------------------------
+    def get_node_ip(self) -> str:
+        """Return this actor's node IP (used to pick the dist master address)."""
+        try:
+            import ray
+            return ray.util.get_node_ip_address()
+        except Exception:
+            import socket
+            return socket.gethostbyname(socket.gethostname())
+
+    def find_free_port(self) -> int:
+        """Bind an ephemeral TCP port on this actor's node and return it."""
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("", 0))
+            return int(sock.getsockname()[1])
+
+    def get_colocation_info(self) -> dict[str, Any]:
+        """Return node id + physical GPU ids so a rollout replica can be pinned
+        to this actor's GPU (verl HYBRID colocation)."""
+        import ray
+        ctx = ray.get_runtime_context()
+        try:
+            gpu_ids = ray.get_gpu_ids()
+        except Exception:
+            gpu_ids = []
+        return {
+            "rank": self.rank,
+            "node_id": ctx.get_node_id(),
+            "gpu_ids": [str(g) for g in gpu_ids],
+        }
+
+    def setup_distributed(
+        self,
+        rank: int,
+        world_size: int,
+        master_addr: str,
+        master_port: int,
+        local_rank: int = 0,
+        backend: str = "cpu:gloo,cuda:nccl",
+        timeout_s: int = 7200,
+    ) -> bool:
+        """Join the cross-actor ``torch.distributed`` group for FSDP sharding.
+
+        verl-aligned: each Ray actor is pinned to one GPU (Ray sets
+        ``CUDA_VISIBLE_DEVICES`` so its device is ``cuda:0`` => ``local_rank=0``),
+        but participates in a single ``world_size``-rank process group so FSDP2
+        ``fully_shard`` shards parameters and reduce-scatters gradients across
+        all actors. Without this, the FSDP backend falls back to an unsharded
+        full replica per actor with no gradient sync (weights diverge).
+        """
+        import os
+        from datetime import timedelta
+
+        import torch
+
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+        os.environ.setdefault("LOCAL_WORLD_SIZE", str(world_size))
+        os.environ["MASTER_ADDR"] = str(master_addr)
+        os.environ["MASTER_PORT"] = str(master_port)
+
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend=backend,
+                world_size=world_size,
+                rank=rank,
+                timeout=timedelta(seconds=int(timeout_s)),
+            )
+        self._log.info(
+            "setup_distributed: rank=%d world_size=%d master=%s:%s local_rank=%d",
+            rank, world_size, master_addr, master_port, local_rank,
+        )
+        return True
+
     def cleanup(self) -> None:
         """Release GPU memory and tear down runtime hooks."""
+        try:
+            import torch
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+        except Exception:
+            pass
         self._log.info("%s.cleanup: default no-op complete.", self.__class__.__name__)

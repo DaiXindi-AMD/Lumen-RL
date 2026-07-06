@@ -239,6 +239,12 @@ class FSDP2Engine(BaseEngine):
     ) -> dict[str, Any]:
         micro_batches = self._prepare_micro_batches(data)
 
+        # verl-aligned packed (remove-padding + varlen) forward. Removes all pad
+        # tokens so the distribution is not flattened by attending to left-pad
+        # (which the AITER attention bias path does not reliably mask). This is
+        # the path validated to match verl to 1e-4; the padded SDPA path is not.
+        use_packing = bool(data.get("use_packed_forward"))
+
         output_lst: list[dict] = []
         ctx = torch.no_grad() if forward_only else nullcontext()
 
@@ -247,14 +253,36 @@ class FSDP2Engine(BaseEngine):
                 is_last = i == len(micro_batches) - 1
                 set_requires_gradient_sync(self.module, is_last)
 
-            with ctx:
-                loss, meta = self.forward_step(mb, loss_function, forward_only)
-                if not forward_only:
-                    loss.backward()
+            if use_packing:
+                from lumenrl.engine.training.packing import (
+                    PackingContext, pack_sequences,
+                )
+                ids = mb["input_ids"]
+                am = mb.get("attention_mask")
+                if am is None:
+                    am = torch.ones_like(ids)
+                packed = pack_sequences(ids.to(self._device_or_cuda()), am.to(self._device_or_cuda()))
+                mb["_packed"] = packed
+                mb["_padded_seq_len"] = int(ids.shape[1])
+                # PackingContext must stay alive through backward so gradient
+                # checkpointing recompute still sees the varlen metadata.
+                with ctx:
+                    with PackingContext(packed.cu_seqlens, packed.max_seqlen):
+                        loss, meta = self.forward_step(mb, loss_function, forward_only)
+                        if not forward_only:
+                            loss.backward()
+            else:
+                with ctx:
+                    loss, meta = self.forward_step(mb, loss_function, forward_only)
+                    if not forward_only:
+                        loss.backward()
 
             output_lst.append(meta)
 
         return self._postprocess_batch(output_lst)
+
+    def _device_or_cuda(self) -> torch.device:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def forward_step(
         self,
@@ -271,19 +299,32 @@ class FSDP2Engine(BaseEngine):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         input_ids = micro_batch["input_ids"].to(device)
-        attention_mask = micro_batch.get("attention_mask")
-        position_ids = micro_batch.get("position_ids")
 
-        model_kwargs: dict[str, Any] = {"input_ids": input_ids, "use_cache": False}
-        if attention_mask is not None:
-            model_kwargs["attention_mask"] = attention_mask.to(device)
-        if position_ids is not None:
-            model_kwargs["position_ids"] = position_ids.to(device)
+        packed = micro_batch.get("_packed")
+        if packed is not None:
+            # Packed (varlen) forward: no pad tokens, exact per-token positions.
+            raw_output = self.module(
+                input_ids=packed.input_ids,
+                position_ids=packed.position_ids,
+                attention_mask=None,
+                use_cache=False,
+            )
+            logits = raw_output.logits if hasattr(raw_output, "logits") else raw_output
+            model_output = self._prepare_packed_outputs(logits, packed, micro_batch)
+        else:
+            attention_mask = micro_batch.get("attention_mask")
+            position_ids = micro_batch.get("position_ids")
 
-        raw_output = self.module(**model_kwargs)
-        logits = raw_output.logits if hasattr(raw_output, "logits") else raw_output
+            model_kwargs: dict[str, Any] = {"input_ids": input_ids, "use_cache": False}
+            if attention_mask is not None:
+                model_kwargs["attention_mask"] = attention_mask.to(device)
+            if position_ids is not None:
+                model_kwargs["position_ids"] = position_ids.to(device)
 
-        model_output = self._prepare_model_outputs(logits, input_ids, micro_batch)
+            raw_output = self.module(**model_kwargs)
+            logits = raw_output.logits if hasattr(raw_output, "logits") else raw_output
+
+            model_output = self._prepare_model_outputs(logits, input_ids, micro_batch)
 
         if loss_function is not None:
             loss, metrics = loss_function(model_output=model_output, data=micro_batch)
@@ -314,10 +355,52 @@ class FSDP2Engine(BaseEngine):
 
         meta = micro_batch.get("meta", {}) if isinstance(micro_batch, dict) else {}
         if meta.get("calculate_entropy", False):
-            result["entropy"] = entropy_from_logits(shift_logits)
+            # fp32 upcast: eager bf16 reduction over the ~152k vocab biases entropy
+            # high; verl-aligned actor/entropy is computed in fp32 (see SMOKE_COMPARE).
+            result["entropy"] = entropy_from_logits(shift_logits.float())
         if meta.get("calculate_sum_pi_squared", False):
             result["sum_pi_squared"] = calculate_sum_pi_squared_from_logits(shift_logits)
 
+        return result
+
+    def _prepare_packed_outputs(
+        self,
+        logits: torch.Tensor,
+        packed: Any,
+        micro_batch: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        """Compute log_probs (and optionally entropy) from packed (flat) logits.
+
+        Mirrors :meth:`_prepare_model_outputs` but on the varlen-packed forward,
+        unpacking back to the ``[B, S-1]`` left-padded layout the loss / metric
+        code expects. Applies verl's ``logits.div_(temperature)`` convention.
+        """
+        from lumenrl.engine.training.packing import (
+            packed_token_entropy,
+            packed_token_log_probs,
+            unpack_log_probs,
+        )
+
+        logits = logits.squeeze(0)  # (total_tokens, V)
+        S = int(micro_batch.get("_padded_seq_len", micro_batch["input_ids"].shape[1]))
+        temperature = float(micro_batch.get("temperature", 1.0) or 1.0)
+
+        flat_lp = packed_token_log_probs(
+            logits, packed.input_ids.squeeze(0), packed.cu_seqlens,
+            temperature=temperature,
+        )
+        log_probs = unpack_log_probs(flat_lp, packed.cu_seqlens, packed.seq_lens, S)
+        result: dict[str, torch.Tensor] = {"log_probs": log_probs}
+
+        meta = micro_batch.get("meta", {}) if isinstance(micro_batch, dict) else {}
+        if meta.get("calculate_entropy", False):
+            flat_ent = packed_token_entropy(
+                logits.detach(), packed.cu_seqlens,
+                temperature=temperature, upcast=True,
+            )
+            result["entropy"] = unpack_log_probs(
+                flat_ent, packed.cu_seqlens, packed.seq_lens, S,
+            )
         return result
 
     def _prepare_micro_batches(self, data: dict[str, Any]) -> list[dict[str, Any]]:
