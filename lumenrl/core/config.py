@@ -214,6 +214,24 @@ class VLLMConfig:
     # ``collective_rpc("reload_weights", weights_path=...)`` + ``reset_prefix_cache``
     # (no engine rebuild). Overridable with env ``LUMEN_VLLM_ASYNC=0/1``.
     online: bool = True
+    # Rollout transport / orchestration:
+    #   "fifo"    -> per-rank subprocess + named-FIFO JSON (default, VLLMEngine)
+    #   "ray_http"-> verl-style: each rank hosts vLLM AsyncLLM inside a Ray actor
+    #                that also runs a uvicorn HTTP server; the trainer drives it
+    #                via Ray RPC (VLLMHttpEngine). Same 8×TP=1 DP layout as verl's
+    #                rollout replicas (tensor_model_parallel_size=1).
+    transport: str = "fifo"
+    # ray_http-only knobs:
+    ray_http_base_port: int = 8700   # actor i listens on base_port + local_rank
+    ray_http_start_server: bool = True  # also launch uvicorn OpenAI server in actor
+    # cumem sleep/wake (verl alignment). On ROCm (cumem_available=False) the
+    # gpu_worker patch falls back to KV-cache-only sleep with weights resident;
+    # on CUDA with cumem, level 2 offloads weights too.
+    enable_sleep_mode: bool = True
+    sleep_level: int = 2
+    # ZMQ CUDA-IPC bucketed weight transfer (verl BucketedWeightSender/Receiver).
+    update_weights_bucket_megabytes: int = 512
+    use_shm: bool = False  # use shared-memory buffer instead of CUDA IPC (NPU)
     # Sampling defaults (overridable per-algorithm in the trainer).
     temperature: float = 1.0
     top_p: float = 1.0

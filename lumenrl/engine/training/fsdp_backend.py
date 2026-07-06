@@ -91,7 +91,15 @@ def _load_hf_model(model_name: str, torch_dtype: torch.dtype = torch.bfloat16) -
 
     rank = dist.get_rank() if dist.is_initialized() else 0
 
-    _patch_hf_attention_with_lumen()
+    # The Lumen/AITER attention patch replaces HF "sdpa" with an AITER varlen
+    # flash-attn kernel. It targets packed (varlen) inputs; on plain padded
+    # batches (e.g. the Ray controller path, which does not pack) its backward
+    # can fault on ROCm. Allow opting out to fall back to pure torch SDPA,
+    # matching the vanilla verl BF16 baseline.
+    if os.environ.get("LUMEN_DISABLE_HF_ATTN_PATCH", "0") == "1":
+        logger.info("[rank %d] HF attention patch disabled; using pure torch SDPA.", rank)
+    else:
+        _patch_hf_attention_with_lumen()
 
     logger.info("[rank %d] Loading HF model: %s (dtype=%s)", rank, model_name, torch_dtype)
     model = AutoModelForCausalLM.from_pretrained(
